@@ -1,21 +1,48 @@
-from typing import cast
+from typing import Any
 
 import torch
 import torch.nn as nn
 from peft import LoraConfig, TaskType, get_peft_model
-from torchtyping import TensorType, patch_typeguard
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from typeguard import typechecked
-
-patch_typeguard()
 
 
 class MedKev(nn.Module):
+    """Score answer options using a language-model backbone and a pointer head.
+
+    The backbone encodes one question per sequence. The pointer head compares
+    the decision-token representation with each closing option-token
+    representation and returns unnormalized logits of shape
+    `(batch_size, num_options)`.
+
+    Args:
+        model_name (str): Hugging Face model ID or local checkpoint directory
+            used to load both the tokenizer and the causal language model.
+            The model's base model must expose an integer `config.hidden_size`.
+        pointer_dim (int): Dimension of the query and key projections used
+            to score options. Defaults to 256.
+        lora_config (LoraConfig | None): Optional LoRA configuration for the
+            backbone. Must use `TaskType.FEATURE_EXTRACTION`, a positive rank,
+            `lora_alpha = 2 * r`, `lora_dropout = 0.05`, and one of the supported
+            Kev target-module sets. Defaults to None.
+        model_kwargs (dict[str, Any]): Keyword arguments passed to
+            `AutoModelForCausalLM.from_pretrained`. Defaults to BF16 weights
+            and SDPA attention. A supplied dictionary replaces these defaults.
+
+    Raises:
+        TypeError: If `lora_config` has an invalid type or the backbone's
+            `config.hidden_size` is not an integer.
+        ValueError: If `lora_config` does not satisfy the Kev requirements.
+    """
+
     def __init__(
         self,
         model_name: str,
         pointer_dim: int = 256,
         lora_config: LoraConfig | None = None,
+        model_kwargs: dict[str, Any] = {
+            "dtype": torch.bfloat16,
+            "attn_implementation": "sdpa",
+        },
     ) -> None:
         super().__init__()
         self._validate_lora_config(lora_config)
@@ -24,7 +51,9 @@ class MedKev(nn.Module):
         self.lora_config = lora_config
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        language_model = AutoModelForCausalLM.from_pretrained(self.model_name)
+        language_model = AutoModelForCausalLM.from_pretrained(
+            self.model_name, **model_kwargs
+        )
         self.backbone = (
             get_peft_model(language_model.base_model, self.lora_config)
             if self.lora_config is not None
@@ -101,20 +130,28 @@ class MedKev(nn.Module):
         if attention_mask is not None and attention_mask.shape != input_ids.shape:
             raise ValueError("attention_mask must have the same shape as input_ids")
 
-    @typechecked
     def forward(
         self,
-        input_ids: TensorType["batch", "sequence", torch.long],
-        option_positions: TensorType["batch", "options", torch.long],
-        decide_position: TensorType["batch", torch.long],
-        attention_mask: TensorType["batch", "sequence"] | None = None,
-    ) -> TensorType["batch", "options"]:
-        """Return logits [B, K] for one question per sequence.
+        input_ids: torch.Tensor,
+        option_positions: torch.Tensor,
+        decide_position: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return logits (batch_size, num_options) for a batch of questions per sequence.
 
-        input_ids: [B, L], optionally right-padded with attention_mask [B, L].
-        option_positions: [B, K], closing option-token offsets in each sequence.
-        decide_position: [B], decision-token offsets in each sequence.
-        Every example must have K real options. Positions index the padded input.
+        Args:
+            input_ids (torch.Tensor): Token IDs of shape (batch_size, seq_len), with dtype
+                `torch.long`. Sequences may be right-padded.
+            option_positions (torch.Tensor): Zero-based indices of closing option tokens,
+                of shape `(batch_size, num_options)`, with dtype `torch.long`. Every example in
+                a batch must have the same number of real options.
+            decide_position (torch.Tensor): Zero-based index of the decision token in each
+                sequence, of shape `(batch_size,)`, with dtype `torch.long`.
+            attention_mask (torch.Tensor): Optional mask of shape `(batch_size, seq_len)`,
+                with 1/True for real tokens and 0/False for padding.
+
+        Returns:
+            Unnormalized option logits of shape `(batch_size, num_options)`.
         """
         batch_size = input_ids.shape[0]
         self._validate_forward_params(
@@ -127,12 +164,12 @@ class MedKev(nn.Module):
         ).last_hidden_state
 
         # decide_position -> (batch_size,...) -> one decision-token position per example in batch
-        decide_position = cast(TensorType, decide_position.to(hidden_state.device))
+        decide_position = decide_position.to(hidden_state.device)
 
-        # option_positions -> (batch_size, K) -> K is the number of options for an example
-        # Note: K can be variable for different batches, but in a single batch,
-        # K has to be the same for all the examples
-        option_positions = cast(TensorType, option_positions.to(hidden_state.device))
+        # option_positions -> (batch_size, num_options)
+        # Note: num_options can be variable for different batches, but in a single batch,
+        # num_options has to be the same for all the examples
+        option_positions = option_positions.to(hidden_state.device)
 
         # batch_indices -> (0, 1, 2, ..., batch_size)
         batch_indices = torch.arange(batch_size, device=hidden_state.device)
@@ -148,4 +185,4 @@ class MedKev(nn.Module):
         key = self.key_projection(option_representation)
         logits = torch.bmm(key, query.unsqueeze(-1)).squeeze(-1) * self.scale
 
-        return cast(TensorType, logits)
+        return logits
