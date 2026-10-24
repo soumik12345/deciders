@@ -134,6 +134,7 @@ class KevDecisionModel(nn.Module):
         option_positions: torch.Tensor,
         decide_position: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        option_mask: torch.Tensor | None = None,
     ):
         if input_ids.ndim != 2:
             raise ValueError("input_ids must have shape [batch_size, sequence_length]")
@@ -147,6 +148,15 @@ class KevDecisionModel(nn.Module):
             raise ValueError("decide_position must have shape [batch_size]")
         if attention_mask is not None and attention_mask.shape != input_ids.shape:
             raise ValueError("attention_mask must have the same shape as input_ids")
+        if option_mask is not None:
+            if option_mask.shape != option_positions.shape:
+                raise ValueError(
+                    "option_mask must have the same shape as option_positions"
+                )
+            if option_mask.dtype != torch.bool:
+                raise TypeError("option_mask must have dtype torch.bool")
+            if not option_mask.any(dim=-1).all().item():
+                raise ValueError("Every question must have at least one real option")
 
     def encode(
         self,
@@ -241,6 +251,7 @@ class KevDecisionModel(nn.Module):
         decide_position: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         *,
+        option_mask: torch.Tensor | None = None,
         temperature: float = 1.0,
     ) -> torch.Tensor:
         """Return logits (batch_size, num_options) for a batch of questions per sequence.
@@ -255,6 +266,8 @@ class KevDecisionModel(nn.Module):
                 sequence, of shape `(batch_size,)`, with dtype `torch.long`.
             attention_mask (torch.Tensor): Optional mask of shape `(batch_size, seq_len)`,
                 with 1/True for real tokens and 0/False for padding.
+            option_mask (torch.Tensor): Boolean tensor matching option_positions. `True` marks a
+                real option and `False` marks padding. `None` means every option is real.
             temperature (float): Temperature applied to normalize the raw logits. During training,
                 it should be `1.0`, i.e, raw unnormalized logits should be used.
                 The temperature should be calibrated during inference or evaluation.
@@ -277,8 +290,6 @@ class KevDecisionModel(nn.Module):
         decide_position = decide_position.to(hidden_state.device)
 
         # option_positions -> (batch_size, num_options)
-        # Note: num_options can be variable for different batches, but in a single batch,
-        # num_options has to be the same for all the examples
         option_positions = option_positions.to(hidden_state.device)
 
         # batch_indices -> (0, 1, 2, ..., batch_size)
@@ -296,5 +307,15 @@ class KevDecisionModel(nn.Module):
         query = self.query_projection(decision_representation)
         key = self.key_projection(option_representation)
         logits = torch.bmm(key, query.unsqueeze(-1)).squeeze(-1) * self.scale
+        logits = logits / temperature
 
-        return logits / temperature
+        # mask logits as per the option mask
+        # this is used when a batch has packed examples with different number of options
+        # and the examples with less than the max options are padded
+        logits = (
+            logits.masked_fill(~option_mask.to(device=logits.device), float("-inf"))
+            if option_mask is not None
+            else logits
+        )
+
+        return logits
