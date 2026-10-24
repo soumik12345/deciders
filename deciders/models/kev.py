@@ -1,9 +1,14 @@
+from __future__ import annotations
+
+import math
 import re
+from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn as nn
-from peft import LoraConfig, TaskType, get_peft_model
+from huggingface_hub import snapshot_download
+from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 _KEV_SPECIAL_TOKENS = (
@@ -29,8 +34,8 @@ class KevDecisionModel(nn.Module):
     a dtype to preserve the backbone/head precision choices.
 
     Args:
-        model_name (str): Hugging Face model ID or local checkpoint directory
-            used to load both the tokenizer and the causal language model.
+        backbone_model_name_or_path (str): Hugging Face model ID or local
+            checkpoint directory used to load the tokenizer and language model.
             The model's base model must expose an integer `config.hidden_size`.
         pointer_dim (int): Dimension of the query and key projections used
             to score options. Defaults to 256.
@@ -41,6 +46,8 @@ class KevDecisionModel(nn.Module):
         model_kwargs (dict[str, Any]): Keyword arguments passed to
             `AutoModelForCausalLM.from_pretrained`. Defaults to BF16 weights
             and SDPA attention. A supplied dictionary replaces these defaults.
+        revision (str | None): Optional backbone revision used to load both
+            the tokenizer and language model. Defaults to None.
 
     Raises:
         TypeError: If `lora_config` has an invalid type or the backbone's
@@ -50,23 +57,30 @@ class KevDecisionModel(nn.Module):
 
     def __init__(
         self,
-        model_name: str,
+        backbone_model_name_or_path: str,
         pointer_dim: int = 256,
         lora_config: LoraConfig | None = None,
         model_kwargs: dict[str, Any] = {
             "dtype": torch.bfloat16,
             "attn_implementation": "sdpa",
         },
+        *,
+        revision: str | None = None,
     ) -> None:
         super().__init__()
         self._validate_lora_config(lora_config)
-        self.model_name = model_name
+        self.backbone_model_name_or_path = backbone_model_name_or_path
         self.pointer_dim = pointer_dim
         self.lora_config = lora_config
+        self.calibration_temperature: float = 1.0
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.backbone_model_name_or_path, revision=revision
+        )
+        if revision is not None:
+            model_kwargs = {**model_kwargs, "revision": revision}
         language_model = AutoModelForCausalLM.from_pretrained(
-            self.model_name, **model_kwargs
+            self.backbone_model_name_or_path, **model_kwargs
         )
         self.backbone = (
             get_peft_model(language_model.base_model, self.lora_config)
@@ -350,7 +364,9 @@ class KevDecisionModel(nn.Module):
                 else [row[mask] for row, mask in zip(logits, option_mask)]
             )
 
-            assert questions_per_record is not None  # Validated before backbone execution.
+            assert (
+                questions_per_record is not None
+            )  # Validated before backbone execution.
             records = []
             offset = 0
             for count in questions_per_record:
@@ -360,3 +376,105 @@ class KevDecisionModel(nn.Module):
             return records
 
         return logits
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_name_or_path: str | Path,
+        *,
+        revision: str | None = None,
+        device: str | torch.device = "cpu",
+        dtype: torch.dtype = torch.float32,
+        attn_implementation: str = "sdpa",
+    ) -> KevDecisionModel:
+        """Load a Kev FP32-trained LoRA checkpoint for inference."""
+        checkpoint = Path(model_name_or_path).expanduser()
+
+        if not checkpoint.is_dir():
+            checkpoint = Path(
+                snapshot_download(
+                    repo_id=str(model_name_or_path),
+                    revision=revision,
+                    allow_patterns=[
+                        "head.pt",
+                        "adapter_config.json",
+                        "adapter_model.safetensors",
+                    ],
+                )
+            )
+
+        metadata = torch.load(
+            checkpoint / "head.pt",
+            map_location="cpu",
+            weights_only=True,
+        )
+
+        if (
+            metadata.get("weights", "lora") != "lora"
+            or not (checkpoint / "adapter_config.json").is_file()
+        ):
+            raise ValueError("This loader requires a Kev LoRA checkpoint")
+
+        if metadata.get("option_isolation", False):
+            raise ValueError(
+                "This checkpoint requires option-isolated attention, "
+                "which KevDecisionModel does not implement"
+            )
+
+        if metadata.get("weights_dtype", "fp32") != "fp32":
+            raise ValueError("This loader supports FP32-trained adapters only")
+
+        temperature = float(metadata.get("temperature", 1.0))
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("Checkpoint temperature must be finite and positive")
+
+        head = metadata["head"]
+        expected_keys = {"q.weight", "q.bias", "k.weight", "k.bias"}
+        if set(head) != expected_keys:
+            raise ValueError(f"Unexpected pointer-head keys: {set(head)}")
+
+        # Load the exact base and tokenizer used to train the adapter.
+        # Do not create a new random adapter in the constructor.
+        model = cls(
+            backbone_model_name_or_path=metadata["base"],
+            revision=metadata.get("base_revision"),
+            pointer_dim=metadata.get("head_dim", 256),
+            lora_config=None,
+            model_kwargs={
+                "dtype": torch.float32,
+                "attn_implementation": attn_implementation,
+            },
+        )
+
+        adapted_backbone = PeftModel.from_pretrained(
+            model.backbone,
+            str(checkpoint),
+            is_trainable=False,
+        )
+        adapter_config = adapted_backbone.peft_config["default"]
+        if not isinstance(adapter_config, LoraConfig):
+            raise TypeError("This loader requires a LoRA adapter configuration")
+        model.lora_config = adapter_config
+
+        # Follow upstream's choice to retain adapters with trained token embeddings.
+        if getattr(model.lora_config, "trainable_token_indices", None):
+            model.backbone = adapted_backbone
+        else:
+            model.backbone = adapted_backbone.merge_and_unload()
+
+        model.query_projection.load_state_dict(
+            {"weight": head["q.weight"], "bias": head["q.bias"]},
+            strict=True,
+        )
+        model.key_projection.load_state_dict(
+            {"weight": head["k.weight"], "bias": head["k.bias"]},
+            strict=True,
+        )
+
+        model.calibration_temperature = temperature
+
+        # Cast only the backbone; pointer projections remain FP32.
+        model.backbone.to(dtype=dtype)
+        model.to(device)
+        model.eval()
+        return model
