@@ -16,7 +16,7 @@ _KEV_SPECIAL_TOKENS = (
 _CONTROL_TOKEN_PATTERN = re.compile(r"<\|([A-Za-z0-9_]+)\|>")
 
 
-class MedKev(nn.Module):
+class KevDecisionModel(nn.Module):
     """Score answer options using a language-model backbone and a pointer head.
 
     The backbone encodes one question per sequence. The pointer head compares

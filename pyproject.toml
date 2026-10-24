@@ -1,7 +1,7 @@
 [project]
-name = "medkev"
+name = "deciders"
 dynamic = ["version"]
-description = "A decion model for medical QnA"
+description = "A library for training decision models"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -71,7 +71,7 @@ build-backend = "hatchling.build"
 source = "vcs"
 
 [tool.hatch.build.targets.wheel]
-packages = ["medkev"]
+packages = ["deciders"]
 
 [tool.ruff]
 target-version = "py312"
@@ -80,7 +80,7 @@ target-version = "py312"
 select = ["I", "F401"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["medkev"]
+known-first-party = ["deciders"]
 section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
 combine-as-imports = true
 
