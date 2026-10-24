@@ -21,8 +21,8 @@ class KevDecisionModel(nn.Module):
 
     The backbone encodes one question per sequence. The pointer head compares
     the decision-token representation with each closing option-token
-    representation and returns unnormalized logits of shape
-    `(batch_size, num_options)`.
+    representation and returns unnormalized logits as a padded tensor or
+    nested lists of records and questions.
 
     The pointer head stays in FP32 and scores FP32 copies of the selected
     backbone outputs, matching Kev. Move the model with `.to(device)` without
@@ -253,15 +253,18 @@ class KevDecisionModel(nn.Module):
         *,
         option_mask: torch.Tensor | None = None,
         temperature: float = 1.0,
-    ) -> torch.Tensor:
-        """Return logits (batch_size, num_options) for a batch of questions per sequence.
+        return_logits: bool = True,
+        questions_per_record: list[int] | None = None,
+    ) -> torch.Tensor | list[list[torch.Tensor]]:
+        """Score a flattened batch containing one question per sequence.
 
         Args:
             input_ids (torch.Tensor): Token IDs of shape (batch_size, seq_len), with dtype
                 `torch.long`. Sequences may be right-padded.
             option_positions (torch.Tensor): Zero-based indices of closing option tokens,
-                of shape `(batch_size, num_options)`, with dtype `torch.long`. Every example in
-                a batch must have the same number of real options.
+                of shape `(batch_size, max_options)`, with dtype `torch.long`.
+                Pad with a valid token index, such as 0, and use option_mask
+                when questions have different numbers of real options.
             decide_position (torch.Tensor): Zero-based index of the decision token in each
                 sequence, of shape `(batch_size,)`, with dtype `torch.long`.
             attention_mask (torch.Tensor): Optional mask of shape `(batch_size, seq_len)`,
@@ -271,15 +274,41 @@ class KevDecisionModel(nn.Module):
             temperature (float): Temperature applied to normalize the raw logits. During training,
                 it should be `1.0`, i.e, raw unnormalized logits should be used.
                 The temperature should be calibrated during inference or evaluation.
+            return_logits (bool): If True, return a padded logits tensor.
+                If False, return logits grouped by record and question, with
+                padded options removed. Both formats contain unnormalized logits.
+            questions_per_record (list[int] | None): Number of consecutive batch
+                rows belonging to each record, in record order. Required when
+                return_logits=False. Entries must be nonnegative integers summing
+                to batch_size; a zero produces an empty question list.
 
         Returns:
-            Temperature-scaled, unnormalized option logits of shape
-            `(batch_size, num_options)`.
+            Temperature-scaled logits: either a tensor of shape
+            `(batch_size, max_options)` with padded options set to negative infinity,
+            or nested lists `records[record_index][question_index]` containing
+            tensors of shape `(num_real_options,)`. Gradients are preserved.
         """
         batch_size = input_ids.shape[0]
         self._validate_forward_params(
-            batch_size, input_ids, option_positions, decide_position, attention_mask
+            batch_size,
+            input_ids,
+            option_positions,
+            decide_position,
+            attention_mask,
+            option_mask,
         )
+        if not return_logits and questions_per_record is None:
+            raise ValueError("questions_per_record is required for grouped output")
+        if questions_per_record is not None:
+            if not isinstance(questions_per_record, list) or any(
+                isinstance(count, bool) or not isinstance(count, int)
+                for count in questions_per_record
+            ):
+                raise TypeError("questions_per_record must be a list of integers")
+            if any(count < 0 for count in questions_per_record):
+                raise ValueError("questions_per_record entries must be nonnegative")
+            if sum(questions_per_record) != batch_size:
+                raise ValueError("questions_per_record must sum to batch_size")
 
         # hiddent_state -> (batch_size, seq_len, hidden_size)
         hidden_state = self.backbone(
@@ -309,13 +338,25 @@ class KevDecisionModel(nn.Module):
         logits = torch.bmm(key, query.unsqueeze(-1)).squeeze(-1) * self.scale
         logits = logits / temperature
 
-        # mask logits as per the option mask
-        # this is used when a batch has packed examples with different number of options
-        # and the examples with less than the max options are padded
-        logits = (
-            logits.masked_fill(~option_mask.to(device=logits.device), float("-inf"))
-            if option_mask is not None
-            else logits
-        )
+        # Exclude padded option readouts from probabilities and loss.
+        if option_mask is not None:
+            option_mask = option_mask.to(logits.device)
+            logits = logits.masked_fill(~option_mask, float("-inf"))
+
+        if not return_logits:
+            question_logits = (
+                list(logits.unbind(dim=0))
+                if option_mask is None
+                else [row[mask] for row, mask in zip(logits, option_mask)]
+            )
+
+            assert questions_per_record is not None  # Validated before backbone execution.
+            records = []
+            offset = 0
+            for count in questions_per_record:
+                records.append(question_logits[offset : offset + count])
+                offset += count
+
+            return records
 
         return logits
