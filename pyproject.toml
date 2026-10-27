@@ -5,11 +5,12 @@ description = "A library for training decision models"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "datasets>=5.1.0",
     "peft>=0.21.2",
     "torchtyping>=0.1.5",
+    "trackio>=0.43.0",
     "transformers>=5.20.2",
     "typeguard>=2.13.3",
-    "wandb>=0.31.0",
 ]
 
 [project.optional-dependencies]
@@ -18,8 +19,7 @@ cpu = [
 ]
 tpu = [
     "torch>=2.13.0",
-    # TorchTPU requires Python 3.11+; keep Python 3.10 available for CPU installs.
-    "torch-tpu>=0.2.0; python_version >= '3.11'",
+    "torch-tpu>=0.2.0",
 ]
 
 [tool.uv.sources]
@@ -46,15 +46,8 @@ dev = [
     "openai>=1.108.2",
 ]
 docs = [
-    "mkdocs>=1.6.1",
-    "mkdocstrings>=0.26.1",
+    "zensical>=0.0.73",
     "mkdocstrings-python>=1.11.1",
-    "mkdocs-material>=9.5.39",
-    "mkdocs-minify-plugin>=0.8.0",
-    "mkdocs-glightbox>=0.4.0",
-    "mkdocs-jupyter>=0.25.0",
-    "mkdocs-panzoom-plugin",
-    "jupyter>=1.1.1",
 ]
 build = [
     "twine>=5.1.1",

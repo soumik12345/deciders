@@ -33,6 +33,46 @@ class KevDecisionModel(nn.Module):
     backbone outputs, matching Kev. Move the model with `.to(device)` without
     a dtype to preserve the backbone/head precision choices.
 
+    !!! example "Performing inference with Kev 0.8B"
+            ``` py title="kev_0_8b_inference.py"
+            import torch
+    
+            from deciders import KevDecisionModel
+    
+            device = torch.device("mps")
+    
+            model = KevDecisionModel.from_pretrained(
+                "jaredpalmer/kev-0.8b",
+                revision="9a45d25eb2ab761841196625383fa1dff0e56c1e",
+                device=device,
+                dtype=torch.float32,
+            )
+    
+            options = ["Billing", "Shipping", "Returns"]
+    
+            input_ids, option_positions, decide_position = model.encode(git a
+                state="I was charged twice for the same order.",
+                question="Which team should handle this request?",
+                options=options,
+                strict=True,
+            )
+    
+            with torch.inference_mode():
+                logits = model(
+                    input_ids=input_ids.to(device),
+                    option_positions=option_positions.to(device),git add 
+                    decide_position=decide_position.to(device),
+                    temperature=model.calibration_temperature,
+                )
+                probabilities = logits.softmax(dim=-1)[0].cpu()
+    
+            print(dict(zip(options, probabilities.tolist())))
+            print("Prediction:", options[probabilities.argmax().item()])
+            ```
+
+    !!! note "Acknowledgements"
+        https://github.com/jaredpalmer/kev
+
     Args:
         backbone_model_name_or_path (str): Hugging Face model ID or local
             checkpoint directory used to load the tokenizer and language model.
