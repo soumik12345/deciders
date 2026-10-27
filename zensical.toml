@@ -12,7 +12,7 @@ copyright = "Copyright &copy; 2026 Soumik Rakshit"
 
 nav = [
   { "Get started" = "index.md" },
-  { "API reference" = [{ "Models" = "api/models.md" }] },
+  { "API reference" = [{ "Models" = "api/models.md" }, { "Data" = "api/data.md" }] },
 ]
 
 # extra_css = ["stylesheets/extra.css"]
