@@ -5,6 +5,7 @@ from abc import abstractmethod
 from typing import TYPE_CHECKING, Any, Sequence
 
 import torch
+from transformers import AutoTokenizer
 
 from deciders.utils.data_utils import render_option_text, render_structured_content
 
@@ -205,8 +206,8 @@ class KevDataEncoder(DataEncoder):
     def __init__(
         self,
         tokenizer: TokenizersBackend | SentencePieceBackend,
-        max_state_tokens: int,
-        max_branch_tokens: int,
+        max_state_tokens: int = 384,
+        max_branch_tokens: int = 1024,
         shuffle_choices: bool = True,
         enforce_strict_encoding: bool = True,
     ) -> None:
@@ -228,3 +229,38 @@ class KevDataEncoder(DataEncoder):
         )
         control_token_patterns = re.compile(r"<\|([A-Za-z0-9_]+)\|>")
         return special_tokens, control_token_patterns
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_name_or_path: str,
+        revision: str | None = None,
+        max_state_tokens: int = 384,
+        max_branch_tokens: int = 1024,
+        shuffle_choices: bool = True,
+        enforce_strict_encoding: bool = True,
+    ) -> KevDataEncoder:
+        """Initialize a `KevDataEncoder` from a checkpoint.
+
+        Args:
+            model_name_or_path (str): The model name or path for initializing the tokenizer.
+            max_state_tokens (int): State-token limit, including its opening marker.
+                Defaults to Kev's training limit of 384.
+            max_branch_tokens (int): Total row-token limit, including the state,
+                question, options, and markers. Defaults to 1024.
+            enforce_strict_encoding (bool): If True, reject an overlong state. Otherwise retain
+                its first `max_state - 1` text tokens, matching Kev's default.
+                An overlong total row is always rejected. Defaults to False.
+        """
+        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, revision=revision)
+        if tokenizer is None:
+            raise ValueError(
+                f"Unable to initialize tokenizer from {model_name_or_path}"
+            )
+        return cls(
+            tokenizer,
+            max_state_tokens,
+            max_branch_tokens,
+            shuffle_choices,
+            enforce_strict_encoding,
+        )

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import re
 from pathlib import Path
 from typing import Any
 
@@ -9,16 +8,7 @@ import torch
 import torch.nn as nn
 from huggingface_hub import snapshot_download
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-_KEV_SPECIAL_TOKENS = (
-    "<|fim_prefix|>",
-    "<|fim_middle|>",
-    "<|box_start|>",
-    "<|box_end|>",
-    "<|fim_suffix|>",
-)
-_CONTROL_TOKEN_PATTERN = re.compile(r"<\|([A-Za-z0-9_]+)\|>")
+from transformers import AutoModelForCausalLM
 
 
 class KevDecisionModel(nn.Module):
@@ -34,41 +24,43 @@ class KevDecisionModel(nn.Module):
     a dtype to preserve the backbone/head precision choices.
 
     !!! example "Performing inference with Kev 0.8B"
-            ``` py title="kev_0_8b_inference.py"
-            import torch
-    
-            from deciders import KevDecisionModel
-    
-            device = torch.device("mps")
-    
-            model = KevDecisionModel.from_pretrained(
-                "jaredpalmer/kev-0.8b",
-                revision="9a45d25eb2ab761841196625383fa1dff0e56c1e",
-                device=device,
-                dtype=torch.float32,
+        ```python
+        import torch
+
+        from deciders.data import KevDataEncoder
+        from deciders.models import KevDecisionModel
+
+        device = torch.device("mps")
+
+        model = KevDecisionModel.from_pretrained(
+            "jaredpalmer/kev-0.8b", device=device, dtype=torch.bfloat16
+        )
+        model.eval()
+
+        encoder = KevDataEncoder.from_pretrained(
+            model.backbone_model_name_or_path, shuffle_choices=False
+        )
+
+        options = ["Billing", "Shipping", "Returns"]
+
+        input_ids, option_positions, decide_position = encoder.encode_question(
+            state="I was charged twice for the same order.",
+            question="Which team should handle this request?",
+            options=options,
+        )
+
+        with torch.inference_mode():
+            logits = model(
+                input_ids=input_ids.to(device),
+                option_positions=option_positions.to(device),
+                decide_position=decide_position.to(device),
+                temperature=model.calibration_temperature,
             )
-    
-            options = ["Billing", "Shipping", "Returns"]
-    
-            input_ids, option_positions, decide_position = model.encode(git a
-                state="I was charged twice for the same order.",
-                question="Which team should handle this request?",
-                options=options,
-                strict=True,
-            )
-    
-            with torch.inference_mode():
-                logits = model(
-                    input_ids=input_ids.to(device),
-                    option_positions=option_positions.to(device),git add 
-                    decide_position=decide_position.to(device),
-                    temperature=model.calibration_temperature,
-                )
-                probabilities = logits.softmax(dim=-1)[0].cpu()
-    
-            print(dict(zip(options, probabilities.tolist())))
-            print("Prediction:", options[probabilities.argmax().item()])
-            ```
+            probabilities = logits.softmax(dim=-1)[0].cpu()
+
+        print(dict(zip(options, probabilities.tolist())))
+        print("Prediction:", options[probabilities.argmax().item()])
+        ```
 
     !!! note "Acknowledgements"
         https://github.com/jaredpalmer/kev
@@ -114,9 +106,6 @@ class KevDecisionModel(nn.Module):
         self.lora_config = lora_config
         self.calibration_temperature: float = 1.0
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.backbone_model_name_or_path, revision=revision
-        )
         if revision is not None:
             model_kwargs = {**model_kwargs, "revision": revision}
         language_model = AutoModelForCausalLM.from_pretrained(
@@ -211,92 +200,6 @@ class KevDecisionModel(nn.Module):
                 raise TypeError("option_mask must have dtype torch.bool")
             if not option_mask.any(dim=-1).all().item():
                 raise ValueError("Every question must have at least one real option")
-
-    def encode(
-        self,
-        state: str,
-        question: str,
-        options: list[str],
-        *,
-        max_state: int = 384,
-        max_branch: int = 1024,
-        strict: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Encode one question as a causal row using Kev's delimiter tokens.
-
-        Args:
-            state (str): Shared context for the question.
-            question (str): Question instructions.
-            options (list[str]): Nonempty list of answer options in scoring order.
-            max_state (int): State-token limit, including its opening marker.
-                Defaults to Kev's training limit of 384.
-            max_branch (int): Total row-token limit, including the state,
-                question, options, and markers. Defaults to 1024.
-            strict (bool): If True, reject an overlong state. Otherwise retain
-                its first `max_state - 1` text tokens, matching Kev's default.
-                An overlong total row is always rejected. Defaults to False.
-
-        Returns:
-            CPU tensors `(input_ids, option_positions, decide_position)` with
-            dtype `torch.long` and shapes `(1, seq_len)`, `(1, num_options)`,
-            and `(1,)`. Readout positions point to the exact closing-option
-            and decision markers. No padding or extra BOS/EOS tokens are added.
-
-        Raises:
-            ValueError: If options are empty, limits are invalid, the tokenizer
-                lacks Kev's single-token delimiters, or a context limit is
-                exceeded under the selected policy.
-
-        Notes:
-            Control-token-like strings in user text are escaped before
-            tokenization. Move the returned tensors to the model's device
-            before passing them to `forward`.
-        """
-        if not options:
-            raise ValueError("Every example must have at least one option")
-        for name, limit in (("max_state", max_state), ("max_branch", max_branch)):
-            if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
-                raise ValueError(f"{name} must be a positive integer")
-
-        marker_ids = []
-        for token in _KEV_SPECIAL_TOKENS:
-            token_id = self.tokenizer.convert_tokens_to_ids(token)
-            if (
-                token_id is None
-                or token_id == self.tokenizer.unk_token_id
-                or self.tokenizer.encode(token, add_special_tokens=False) != [token_id]
-            ):
-                raise ValueError(
-                    f"Tokenizer must provide Kev delimiter {token!r} as a single token"
-                )
-            marker_ids.append(token_id)
-        state_id, question_id, option_id, close_id, decide_id = marker_ids
-
-        def user_ids(text: str) -> list[int]:
-            escaped = _CONTROL_TOKEN_PATTERN.sub(r"<¦\1¦>", text)
-            return self.tokenizer.encode(escaped, add_special_tokens=False)
-
-        state_tokens = user_ids(state)
-        if strict and len(state_tokens) + 1 > max_state:
-            raise ValueError(
-                f"state exceeds {max_state} tokens: {len(state_tokens) + 1}"
-            )
-        ids = [state_id] + state_tokens[: max_state - 1]
-        ids += [question_id] + user_ids(question)
-        option_positions = []
-        for option in options:
-            ids += [option_id] + user_ids(option) + [close_id]
-            option_positions.append(len(ids) - 1)
-        ids.append(decide_id)
-
-        if len(ids) > max_branch:
-            raise ValueError(f"row exceeds {max_branch} tokens: {len(ids)}")
-
-        return (
-            torch.tensor([ids], dtype=torch.long, device="cpu"),
-            torch.tensor([option_positions], dtype=torch.long, device="cpu"),
-            torch.tensor([len(ids) - 1], dtype=torch.long, device="cpu"),
-        )
 
     def forward(
         self,
@@ -427,7 +330,7 @@ class KevDecisionModel(nn.Module):
         dtype: torch.dtype = torch.float32,
         attn_implementation: str = "sdpa",
     ) -> KevDecisionModel:
-        """Load a Kev FP32-trained LoRA checkpoint for inference."""
+        """Load a Kev trained checkpoint."""
         checkpoint = Path(model_name_or_path).expanduser()
 
         if not checkpoint.is_dir():
