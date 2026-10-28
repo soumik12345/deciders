@@ -53,6 +53,7 @@ trainer_config = SupervisedTrainerConfig(
     dataloader_config=dataloader_config,
     model_config=model_config,
     trackio_config=trackio_config,
+    epochs=2,
 )
 
 
@@ -113,6 +114,7 @@ class KevTrainer(SupervisedTrainer):
                     data_encoder if is_training else validation_encoder
                 ),
             )
+        self.config.steps = self.config.epochs * len(dataloaders["train"])
         return data_encoder, dataloaders
 
     def create_model(self) -> KevDecisionModel:

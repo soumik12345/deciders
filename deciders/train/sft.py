@@ -9,10 +9,11 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import trackio
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor
 from torch.utils.data import DistributedSampler
 
 from deciders.models.kev import KevDecisionModel
-from deciders.utils.train_utils import create_optimizer
+from deciders.utils.train_utils import create_lr_scheduler, create_optimizer
 
 if TYPE_CHECKING:
     from torch.utils.data import DataLoader
@@ -49,10 +50,12 @@ class SupervisedTrainerConfig:
     model_config: KevDecisionModelConfig
     trackio_config: TrackioConfig
     seed: int = 42
+    epochs: int = 1
     steps: int = 1
     backend: str = "tpu"
     enable_fsdp: bool = True
     validation_interval: int = 100
+    max_grad_norm: float = 1.0
     optimizer_config: dict[str, Any] = field(
         default_factory=lambda: {
             "name": "AdamW",
@@ -60,6 +63,20 @@ class SupervisedTrainerConfig:
             "weight_decay": 0.01,
             "foreach": False,
             "fused": False,
+        }
+    )
+    lr_scheduler_config: dict[str, Any] = field(
+        default_factory=lambda: {
+            "name": "OneCycleLR",
+            "max_lr": 1e-4,
+            "pct_start": 0.1,
+            "anneal_strategy": "cos",
+            "div_factor": 25.0,
+            "final_div_factor": 1e4,
+            "cycle_momentum": True,
+            "base_momentum": 0.85,
+            "max_momentum": 0.95,
+            "three_phase": False,
         }
     )
 
@@ -88,15 +105,6 @@ class SupervisedTrainer(ABC):
         if self.validation_loader is None:
             self.validation_loader = dataloaders.get("val")
 
-        self.run = trackio.init(
-            project=self.config.trackio_config.project_name,
-            name=self.config.trackio_config.run_name,
-            group=self.config.trackio_config.group_name,
-            space_id=self.config.trackio_config.space_id,
-            private=self.config.trackio_config.private,
-            config=asdict(self.config),
-        )
-
         self.model = self.create_model()
         self.model = self.model.shard(mesh) if self.config.enable_fsdp else self.model
         self.model = torch.compile(
@@ -107,6 +115,19 @@ class SupervisedTrainer(ABC):
         self.optimizer = create_optimizer(
             (param for param in self.model.parameters() if param.requires_grad),
             self.config.optimizer_config,
+        )
+        self.lr_scheduler = create_lr_scheduler(
+            self.optimizer,
+            {**self.config.lr_scheduler_config, "total_steps": self.config.steps},
+        )
+
+        self.run = trackio.init(
+            project=self.config.trackio_config.project_name,
+            name=self.config.trackio_config.run_name,
+            group=self.config.trackio_config.group_name,
+            space_id=self.config.trackio_config.space_id,
+            private=self.config.trackio_config.private,
+            config=asdict(self.config),
         )
 
     @abstractmethod
@@ -121,26 +142,58 @@ class SupervisedTrainer(ABC):
             "Suclasses of the SFTTrainer must overrive SFTTrainer.create_model"
         )
 
+    def clip_gradients(self) -> float:
+        """Clip gradients in place and return their pre-clipping global L2 norm."""
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            parameters=(
+                parameter
+                for parameter in self.model.parameters()
+                if parameter.requires_grad
+            ),
+            max_norm=self.config.max_grad_norm,
+            norm_type=2.0,
+            error_if_nonfinite=True,
+            foreach=False,
+        )
+
+        # Under FSDP2, the returned norm can itself be a DTensor, so we need to
+        # materialize the global scalar for logging on every rank.
+        if isinstance(grad_norm, DTensor):
+            grad_norm = grad_norm.full_tensor()
+
+        return grad_norm.item()
+
     def train_step(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
         batch = {key: value.to(self.device) for key, value in batch.items()}
         labels = batch.pop("labels")
         weights = batch.pop("question_weights")
+
         self.optimizer.zero_grad(set_to_none=True)
+
         logits = self.model(**batch, temperature=1.0, return_logits=True)
+
         per_question_loss = F.cross_entropy(logits.float(), labels, reduction="none")
         record_weight = weights.sum()
         loss = (per_question_loss * weights).sum() / record_weight
+
+        lr_for_logging = self.optimizer.param_groups[0]["lr"]
         loss.backward()
+        grad_norm = self.clip_gradients()
         self.optimizer.step()
+        self.lr_scheduler.step()
+
         with torch.no_grad():
             predictions = logits.argmax(dim=-1)
             correct_predictions = predictions.eq(labels).float()
+
         return {
             "train/loss": loss.item(),
             "train/accuracy_record": (
                 (correct_predictions * weights).sum() / record_weight
             ).item(),
             "train/accuracy_question": correct_predictions.mean().item(),
+            "train/learning_rate": lr_for_logging,
+            "train/grad_norm": grad_norm,
         }
 
     def train_step_fsdp(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
@@ -161,8 +214,11 @@ class SupervisedTrainer(ABC):
         loss_for_gradient_computation = (
             local_loss_sum * dist.get_world_size() / global_weight
         )
+        lr_for_logging = self.optimizer.param_groups[0]["lr"]
         loss_for_gradient_computation.backward()
+        grad_norm = self.clip_gradients()
         self.optimizer.step()
+        self.lr_scheduler.step()
 
         with torch.no_grad():
             correct_predictions = logits.argmax(dim=-1).eq(labels).float()
@@ -185,6 +241,8 @@ class SupervisedTrainer(ABC):
             "train/loss": loss_sum / weight,
             "train/accuracy_record": record_correct / weight,
             "train/accuracy_question": question_correct / count,
+            "train/learning_rate": lr_for_logging,
+            "train/grad_norm": grad_norm,
         }
 
     @torch.no_grad()
@@ -289,6 +347,9 @@ class SupervisedTrainer(ABC):
         epoch = 0
         if isinstance(self.train_loader.sampler, DistributedSampler):
             self.train_loader.sampler.set_epoch(epoch)
+        train_step_fn = (
+            self.train_step_fsdp if self.config.enable_fsdp else self.train_step
+        )
         train_iterator = iter(self.train_loader)
         self.model.train()
         for step in range(1, self.config.steps + 1):
@@ -301,11 +362,7 @@ class SupervisedTrainer(ABC):
                 train_iterator = iter(self.train_loader)
                 batch = next(train_iterator)
 
-            train_metrics = (
-                self.train_step(batch)
-                if not self.config.enable_fsdp
-                else self.train_step_fsdp(batch)
-            )
+            train_metrics = train_step_fn(batch)
             if validation_loader is not None and (
                 step % self.config.validation_interval == 0 or step == self.config.steps
             ):
