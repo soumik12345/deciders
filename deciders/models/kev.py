@@ -451,7 +451,7 @@ class KevDecisionModel(nn.Module):
                 missing or is not an ``nn.ModuleList``.
         """
         # Set the unsharded stored parameter dtype to FP32
-        self.float()
+        self.to(device=torch.device(mesh.device_type), dtype=torch.float32)
 
         # For the backbone, FSDP2 materializes BF16 parameters
         # for computing activations and gradients.

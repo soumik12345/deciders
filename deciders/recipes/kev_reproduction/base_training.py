@@ -14,6 +14,7 @@ from datasets import load_dataset
 from peft import TaskType
 from peft.tuners.lora.config import LoraConfig
 from torch.utils.data import DataLoader, DistributedSampler
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedDeltaNet
 
 from deciders.data import DataCollator, KevDataEncoder
 from deciders.models.kev import KevDecisionModel, KevDecisionModelConfig
@@ -86,7 +87,11 @@ class KevTrainer(SupervisedTrainer):
         return data_encoder, dataloaders
 
     def create_model(self) -> KevDecisionModel:
-        return KevDecisionModel(self.config.model_config)
+        model = KevDecisionModel(self.config.model_config)
+        for module in model.modules():
+            if isinstance(module, Qwen3_5GatedDeltaNet):
+                module.forward = torch.compiler.disable(module.forward, recursive=True)  # type: ignore
+        return model
 
 
 if __name__ == "__main__":
@@ -96,9 +101,7 @@ if __name__ == "__main__":
         group_name="kev_0_8b_repro",
         space_id="geekyrakshit/deciders-trackio",
     )
-    dataloader_config = DataloaderConfig(
-        dataset_name="jaredpalmer/kev-suites", batch_size=8
-    )
+    dataloader_config = DataloaderConfig(dataset_name="jaredpalmer/kev-suites")
     model_config = KevDecisionModelConfig(
         backbone_model_name_or_path="Qwen/Qwen3.5-0.8B-Base",
         pointer_dim=256,
