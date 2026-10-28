@@ -1,3 +1,11 @@
+"""
+Run using:
+
+```bash
+uv run python deciders/recipes/kev_reproduction/base_training.py
+```
+"""
+
 import json
 from typing import Any
 
@@ -14,49 +22,6 @@ from deciders.train.sft import (
     SupervisedTrainer,
     SupervisedTrainerConfig,
     TrackioConfig,
-)
-
-trackio_config = TrackioConfig(project_name="deciders", run_name="kev_0_8b_repro_base")
-dataloader_config = DataloaderConfig(
-    dataset_name="jaredpalmer/kev-suites", batch_size=8
-)
-model_config = KevDecisionModelConfig(
-    backbone_model_name_or_path="Qwen/Qwen3.5-0.8B-Base",
-    pointer_dim=256,
-    lora_config=LoraConfig(
-        task_type=TaskType.FEATURE_EXTRACTION,
-        r=16,
-        lora_alpha=32,
-        lora_dropout=0.05,
-        bias="none",
-        target_modules=[
-            # Full-attention projections
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            # MLP projections
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-            # Gated DeltaNet projections
-            "in_proj_qkv",
-            "in_proj_z",
-            "in_proj_a",
-            "in_proj_b",
-            "out_proj",
-        ],
-    ),
-    model_kwargs={
-        "dtype": torch.float32,
-        "attn_implementation": "sdpa",
-    },
-)
-trainer_config = SupervisedTrainerConfig(
-    dataloader_config=dataloader_config,
-    model_config=model_config,
-    trackio_config=trackio_config,
-    epochs=2,
 )
 
 
@@ -124,8 +89,56 @@ class KevTrainer(SupervisedTrainer):
         return KevDecisionModel(self.config.model_config)
 
 
-trainer = KevTrainer(config=trainer_config)
-try:
-    trainer.train()
-finally:
-    trainer.finish()
+if __name__ == "__main__":
+    trackio_config = TrackioConfig(
+        project_name="deciders",
+        run_name="kev_0_8b_repro_base",
+        group_name="kev_0_8b_repro",
+        space_id="geekyrakshit/deciders-trackio",
+    )
+    dataloader_config = DataloaderConfig(
+        dataset_name="jaredpalmer/kev-suites", batch_size=8
+    )
+    model_config = KevDecisionModelConfig(
+        backbone_model_name_or_path="Qwen/Qwen3.5-0.8B-Base",
+        pointer_dim=256,
+        lora_config=LoraConfig(
+            task_type=TaskType.FEATURE_EXTRACTION,
+            r=16,
+            lora_alpha=32,
+            lora_dropout=0.05,
+            bias="none",
+            target_modules=[
+                # Full-attention projections
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                # MLP projections
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+                # Gated DeltaNet projections
+                "in_proj_qkv",
+                "in_proj_z",
+                "in_proj_a",
+                "in_proj_b",
+                "out_proj",
+            ],
+        ),
+        model_kwargs={
+            "dtype": torch.float32,
+            "attn_implementation": "sdpa",
+        },
+    )
+    trainer_config = SupervisedTrainerConfig(
+        dataloader_config=dataloader_config,
+        model_config=model_config,
+        trackio_config=trackio_config,
+        epochs=2,
+    )
+    trainer = KevTrainer(config=trainer_config)
+    try:
+        trainer.train()
+    finally:
+        trainer.finish()
