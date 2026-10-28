@@ -27,6 +27,10 @@ class DataEncoder:
         enforce_strict_encoding (bool): If True, reject an overlong state. Otherwise retain
             its first `max_state - 1` text tokens, matching Kev's default.
             An overlong total row is always rejected. Defaults to False.
+        use_nota_distraction (bool): Use "none of the above" distraction in questions of type
+            "choice".
+        nota_distraction_proba (float): Probability of a "choice"-type question to face the
+            "none of the above" distraction.
     """
 
     def __init__(
@@ -36,12 +40,20 @@ class DataEncoder:
         max_branch_tokens: int,
         shuffle_choices: bool = True,
         enforce_strict_encoding: bool = True,
+        use_nota_distraction: bool = True,
+        nota_distraction_proba: float = 0.5,
     ) -> None:
+        if not (0.0 <= nota_distraction_proba <= 1.0):
+            raise ValueError("nota_distraction_proba must be between 0 and 1.")
+
         self.tokenizer = tokenizer
         self.max_state_tokens = max_state_tokens
         self.max_branch_tokens = max_branch_tokens
         self.shuffle_choices = shuffle_choices
         self.enforce_strict_encoding = enforce_strict_encoding
+        self.use_nota_distraction = use_nota_distraction
+        self.nota_distraction_proba = nota_distraction_proba
+
         self.special_tokens, self.control_token_pattern = self.get_token_patterns()
 
     @abstractmethod
@@ -52,6 +64,21 @@ class DataEncoder:
                 "special_tokens (a list of special tokens) and control_token_pattern (a re.Pattern)",
             )
         )
+
+    def apply_nota_distraction(
+        self, options: list[str], label: int
+    ) -> tuple[list[str], int]:
+        if (
+            not self.use_nota_distraction
+            or len(options) < 2
+            or torch.rand(()).item() >= self.nota_distraction_proba
+        ):
+            return options, label
+
+        options = list(options)
+
+        options.append("None of the above")
+        return options, label
 
     def encode_question(
         self,
@@ -146,6 +173,10 @@ class DataEncoder:
                 keys = list(criteria)
                 options = [render_option_text(key, criteria[key]) for key in keys]
                 label = keys.index(raw_label)
+
+                if self.use_nota_distraction:
+                    options, label = self.apply_nota_distraction(options, label)
+
                 if self.shuffle_choices:
                     order = torch.randperm(len(options)).tolist()
                     options = [options[index] for index in order]
@@ -201,6 +232,10 @@ class KevDataEncoder(DataEncoder):
         enforce_strict_encoding (bool): If True, reject an overlong state. Otherwise retain
             its first `max_state - 1` text tokens, matching Kev's default.
             An overlong total row is always rejected. Defaults to False.
+        use_nota_distraction (bool): Use "none of the above" distraction in questions of
+            type "choice".
+        nota_distraction_proba (float): Probability of a "choice"-type question to face the
+            "none of the above" distraction.
     """
 
     def __init__(
@@ -209,14 +244,18 @@ class KevDataEncoder(DataEncoder):
         max_state_tokens: int = 384,
         max_branch_tokens: int = 1024,
         shuffle_choices: bool = True,
+        use_nota_distraction: bool = True,
+        nota_distraction_proba: float = 0.5,
         enforce_strict_encoding: bool = True,
     ) -> None:
         super().__init__(
-            tokenizer,
-            max_state_tokens,
-            max_branch_tokens,
-            shuffle_choices,
-            enforce_strict_encoding,
+            tokenizer=tokenizer,
+            max_state_tokens=max_state_tokens,
+            max_branch_tokens=max_branch_tokens,
+            shuffle_choices=shuffle_choices,
+            use_nota_distraction=use_nota_distraction,
+            nota_distraction_proba=nota_distraction_proba,
+            enforce_strict_encoding=enforce_strict_encoding,
         )
 
     def get_token_patterns(self):
@@ -238,6 +277,8 @@ class KevDataEncoder(DataEncoder):
         max_state_tokens: int = 384,
         max_branch_tokens: int = 1024,
         shuffle_choices: bool = True,
+        use_nota_distraction: bool = True,
+        nota_distraction_proba: float = 0.5,
         enforce_strict_encoding: bool = True,
     ) -> KevDataEncoder:
         """Initialize a `KevDataEncoder` from a checkpoint.
@@ -251,6 +292,10 @@ class KevDataEncoder(DataEncoder):
             enforce_strict_encoding (bool): If True, reject an overlong state. Otherwise retain
                 its first `max_state - 1` text tokens, matching Kev's default.
                 An overlong total row is always rejected. Defaults to False.
+            use_nota_distraction (bool): Use "none of the above" distraction
+                in questions of type "choice".
+            nota_distraction_proba (float): Probability of a "choice"-type question to face the
+                "none of the above" distraction.
         """
         tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, revision=revision)
         if tokenizer is None:
@@ -258,9 +303,11 @@ class KevDataEncoder(DataEncoder):
                 f"Unable to initialize tokenizer from {model_name_or_path}"
             )
         return cls(
-            tokenizer,
-            max_state_tokens,
-            max_branch_tokens,
-            shuffle_choices,
-            enforce_strict_encoding,
+            tokenizer=tokenizer,
+            max_state_tokens=max_state_tokens,
+            max_branch_tokens=max_branch_tokens,
+            shuffle_choices=shuffle_choices,
+            use_nota_distraction=use_nota_distraction,
+            nota_distraction_proba=nota_distraction_proba,
+            enforce_strict_encoding=enforce_strict_encoding,
         )

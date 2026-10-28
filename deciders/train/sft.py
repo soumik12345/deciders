@@ -32,6 +32,8 @@ class DataloaderConfig:
     max_state_tokens: int = 384
     max_branch_tokens: int = 1024
     shuffle_choices: bool = True
+    use_nota_distraction: bool = True
+    nota_distraction_proba: float = 0.5
     enforce_strict_encoding: bool = True
     dataset_kwargs: dict[str, Any] = field(default_factory=dict)
 
