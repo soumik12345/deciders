@@ -2,19 +2,27 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import trackio
+from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor
+from torch.utils.data import DistributedSampler
+from tqdm.auto import tqdm
 
 from deciders.models.kev import KevDecisionModel
-from deciders.utils.train_utils import create_optimizer
+from deciders.utils.train_utils import create_lr_scheduler, create_optimizer
 
 if TYPE_CHECKING:
     from torch.utils.data import DataLoader
 
     from deciders.data import DataEncoder
+    from deciders.models.kev import KevDecisionModel, KevDecisionModelConfig
 
 
 @dataclass
@@ -26,6 +34,8 @@ class DataloaderConfig:
     max_state_tokens: int = 384
     max_branch_tokens: int = 1024
     shuffle_choices: bool = True
+    use_nota_distraction: bool = True
+    nota_distraction_proba: float = 0.5
     enforce_strict_encoding: bool = True
     dataset_kwargs: dict[str, Any] = field(default_factory=dict)
 
@@ -40,28 +50,62 @@ class TrackioConfig:
 
 
 @dataclass
-class SFTTrainerConfig:
+class SupervisedTrainerConfig:
     dataloader_config: DataloaderConfig
+    model_config: KevDecisionModelConfig
     trackio_config: TrackioConfig
+    seed: int = 42
+    epochs: int = 1
     steps: int = 1
+    backend: str = "tpu"
+    enable_fsdp: bool = True
     validation_interval: int = 100
+    checkpoint_interval: int = 100
+    checkpoint_dir: Path | str | None = None
+    max_grad_norm: float = 1.0
     optimizer_config: dict[str, Any] = field(
         default_factory=lambda: {
             "name": "AdamW",
-            "lr": 1e-3,
+            "lr": 1e-4,
             "weight_decay": 0.01,
+            "foreach": False,
+            "fused": True,
+        }
+    )
+    lr_scheduler_config: dict[str, Any] = field(
+        default_factory=lambda: {
+            "name": "OneCycleLR",
+            "max_lr": 1e-4,
+            "pct_start": 0.1,
+            "anneal_strategy": "cos",
+            "div_factor": 25.0,
+            "final_div_factor": 1e4,
+            "cycle_momentum": True,
+            "base_momentum": 0.85,
+            "max_momentum": 0.95,
+            "three_phase": False,
         }
     )
 
 
-class SFTTrainer(ABC):
-    def __init__(self, model: KevDecisionModel, config: SFTTrainerConfig) -> None:
-        self.model = model
+class SupervisedTrainer(ABC):
+    def __init__(self, config: SupervisedTrainerConfig) -> None:
         self.config = config
-        self.device = next(self.model.parameters()).device
-        self.optimizer = create_optimizer(
-            self.model.parameters(), self.config.optimizer_config
-        )
+
+        self.rank = 0
+        self.world_size = 1
+        if self.config.enable_fsdp:
+            if self.config.backend == "tpu":
+                dist.init_process_group(backend="tpu_dist")
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+            mesh = DeviceMesh(
+                device_type="tpu",
+                mesh=torch.arange(self.world_size),
+                mesh_dim_names=("fsdp",),
+            )
+
+        torch.manual_seed(self.config.seed)
         self.data_encoder, dataloaders = self.create_dataloader()
         if "train" not in dataloaders:
             raise ValueError("create_dataloader() must provide a 'train' dataloader.")
@@ -70,14 +114,27 @@ class SFTTrainer(ABC):
         if self.validation_loader is None:
             self.validation_loader = dataloaders.get("val")
 
-        self.run = trackio.init(
-            project=self.config.trackio_config.project_name,
-            name=self.config.trackio_config.run_name,
-            group=self.config.trackio_config.group_name,
-            space_id=self.config.trackio_config.space_id,
-            private=self.config.trackio_config.private,
-            config=asdict(self.config),
+        self.model = self.create_model()
+        self.model = self.model.shard(mesh) if self.config.enable_fsdp else self.model
+        self.model.compile(backend=self.config.backend, fullgraph=False, dynamic=False)
+
+        self.device = next(self.model.parameters()).device
+        self.optimizer = create_optimizer(
+            (param for param in self.model.parameters() if param.requires_grad),
+            self.config.optimizer_config,
         )
+        self.lr_scheduler = create_lr_scheduler(
+            self.optimizer,
+            {**self.config.lr_scheduler_config, "total_steps": self.config.steps},
+        )
+
+        self.checkpoint_dir = Path(
+            self.config.checkpoint_dir
+            if self.config.checkpoint_dir is not None
+            else "./checkpoint_dir"
+        )
+
+        self.initialize_trackio()
 
     @abstractmethod
     def create_dataloader(self) -> tuple[DataEncoder, dict[str, DataLoader]]:
@@ -85,26 +142,132 @@ class SFTTrainer(ABC):
             "Suclasses of the SFTTrainer must overrive SFTTrainer.create_dataloader"
         )
 
+    @abstractmethod
+    def create_model(self) -> KevDecisionModel:
+        raise NotImplementedError(
+            "Suclasses of the SFTTrainer must overrive SFTTrainer.create_model"
+        )
+
+    def initialize_trackio(self):
+        self.run = None
+        if self.rank == 0:
+            run_config = asdict(self.config)
+            run_config["checkpoint_dir"] = str(self.checkpoint_dir)
+            run_config["world_size"] = self.world_size
+            run_config["total_batch_size"] = (
+                self.config.dataloader_config.batch_size * self.world_size
+            )
+            self.run = trackio.init(
+                project=self.config.trackio_config.project_name,
+                name=self.config.trackio_config.run_name,
+                group=self.config.trackio_config.group_name,
+                space_id=self.config.trackio_config.space_id,
+                private=self.config.trackio_config.private,
+                config=run_config,
+                auto_log_gpu=self.config.backend != "cuda",
+            )
+
+    def clip_gradients(self) -> float:
+        """Clip gradients in place and return their pre-clipping global L2 norm."""
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            parameters=(
+                parameter
+                for parameter in self.model.parameters()
+                if parameter.requires_grad
+            ),
+            max_norm=self.config.max_grad_norm,
+            norm_type=2.0,
+            error_if_nonfinite=True,
+            foreach=False,
+        )
+
+        # Under FSDP2, the returned norm can itself be a DTensor, so we need to
+        # materialize the global scalar for logging on every rank.
+        if isinstance(grad_norm, DTensor):
+            grad_norm = grad_norm.full_tensor()
+
+        return grad_norm.item()
+
     def train_step(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
         batch = {key: value.to(self.device) for key, value in batch.items()}
         labels = batch.pop("labels")
         weights = batch.pop("question_weights")
+
         self.optimizer.zero_grad(set_to_none=True)
+
         logits = self.model(**batch, temperature=1.0, return_logits=True)
+
         per_question_loss = F.cross_entropy(logits.float(), labels, reduction="none")
         record_weight = weights.sum()
         loss = (per_question_loss * weights).sum() / record_weight
+
+        lr_for_logging = self.optimizer.param_groups[0]["lr"]
         loss.backward()
+        grad_norm = self.clip_gradients()
         self.optimizer.step()
+        self.lr_scheduler.step()
+
         with torch.no_grad():
             predictions = logits.argmax(dim=-1)
             correct_predictions = predictions.eq(labels).float()
+
         return {
             "train/loss": loss.item(),
             "train/accuracy_record": (
                 (correct_predictions * weights).sum() / record_weight
             ).item(),
             "train/accuracy_question": correct_predictions.mean().item(),
+            "train/learning_rate": lr_for_logging,
+            "train/grad_norm": grad_norm,
+        }
+
+    def train_step_fsdp(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
+        batch = {key: value.to(self.device) for key, value in batch.items()}
+        labels = batch.pop("labels")
+        weights = batch.pop("question_weights")
+
+        self.optimizer.zero_grad(set_to_none=True)
+
+        logits = self.model(**batch, temperature=1.0, return_logits=True)
+        per_question_loss = F.cross_entropy(logits.float(), labels, reduction="none")
+        local_loss_sum = (per_question_loss * weights).sum()
+        local_weight = weights.sum()
+
+        global_weight = local_weight.detach().clone()
+        dist.all_reduce(global_weight, op=dist.ReduceOp.SUM)
+
+        loss_for_gradient_computation = (
+            local_loss_sum * dist.get_world_size() / global_weight
+        )
+        lr_for_logging = self.optimizer.param_groups[0]["lr"]
+        loss_for_gradient_computation.backward()
+        grad_norm = self.clip_gradients()
+        self.optimizer.step()
+        self.lr_scheduler.step()
+
+        with torch.no_grad():
+            correct_predictions = logits.argmax(dim=-1).eq(labels).float()
+            stats = torch.stack(
+                [
+                    local_loss_sum.detach(),
+                    (correct_predictions * weights).sum(),
+                    correct_predictions.sum(),
+                    local_weight,
+                    weights.new_tensor(labels.numel()),
+                ]
+            )
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+
+            loss_sum, record_correct, question_correct, weight, count = (
+                stats.cpu().tolist()
+            )
+
+        return {
+            "train/loss": loss_sum / weight,
+            "train/accuracy_record": record_correct / weight,
+            "train/accuracy_question": question_correct / count,
+            "train/learning_rate": lr_for_logging,
+            "train/grad_norm": grad_norm,
         }
 
     @torch.no_grad()
@@ -127,7 +290,13 @@ class SFTTrainer(ABC):
 
     @torch.no_grad()
     def perform_validation(self, validation_loader: DataLoader) -> dict[str, float]:
-        """Aggregate validation metrics and restore the model's previous mode."""
+        """Aggregate validation metrics locally and, with FSDP, across ranks.
+
+        Reduce metric numerators and denominators once after the local loop,
+        then compute global means. All FSDP ranks must participate with matching
+        forward counts. The loader must avoid counting sampler-padding duplicates
+        for exact dataset metrics. Restore the model's previous mode on exit.
+        """
         validation_metrics = {
             "validation/loss": 0.0,
             "validation/accuracy_record": 0.0,
@@ -135,10 +304,18 @@ class SFTTrainer(ABC):
         }
         total_record_weight = 0.0
         total_questions = 0
+        progress = tqdm(
+            validation_loader,
+            desc="Validation",
+            unit="batch",
+            leave=False,
+            disable=self.rank != 0,
+            mininterval=1.0,
+        )
         was_training = self.model.training
         self.model.eval()
         try:
-            for batch in validation_loader:
+            for batch in progress:
                 batch_metrics = self.validation_step(batch)
                 record_weight = batch["question_weights"].sum().item()
                 question_count = batch["labels"].numel()
@@ -151,6 +328,34 @@ class SFTTrainer(ABC):
                     validation_metrics[name] += batch_metrics[name] * denominator
                 total_record_weight += record_weight
                 total_questions += question_count
+                if self.rank == 0 and total_record_weight > 0:
+                    running_loss = (
+                        validation_metrics["validation/loss"] / total_record_weight
+                    )
+                    progress.set_postfix_str(
+                        f"local loss={running_loss:.4f}", refresh=False
+                    )
+
+            if self.config.enable_fsdp:
+                totals = torch.tensor(
+                    [
+                        validation_metrics["validation/loss"],
+                        validation_metrics["validation/accuracy_record"],
+                        validation_metrics["validation/accuracy_question"],
+                        total_record_weight,
+                        total_questions,
+                    ],
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+                (
+                    validation_metrics["validation/loss"],
+                    validation_metrics["validation/accuracy_record"],
+                    validation_metrics["validation/accuracy_question"],
+                    total_record_weight,
+                    total_questions,
+                ) = totals.cpu().tolist()
 
             if total_questions == 0 or total_record_weight <= 0:
                 raise ValueError(
@@ -168,27 +373,146 @@ class SFTTrainer(ABC):
                 ),
             }
         finally:
+            progress.close()
             self.model.train(was_training)
 
+    def save_checkpoint(
+        self,
+        step: int,
+        epoch: int,
+        best_loss: float,
+        artifact_name: str,
+        aliases: list[str],
+    ) -> None:
+        # Collective operation: all FSDP ranks must enter.
+        model_state, optimizer_state = get_state_dict(
+            self.model,
+            self.optimizer,
+            options=StateDictOptions(
+                full_state_dict=True,
+                cpu_offload=True,
+            ),
+        )
+
+        if self.rank != 0:
+            return
+
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        temporary = self.checkpoint_dir / "training.pt.tmp"
+        checkpoint = self.checkpoint_dir / "training.pt"
+
+        torch.save(
+            {
+                "format_version": 1,
+                "model": model_state,
+                "optimizer": optimizer_state,
+                "scheduler": self.lr_scheduler.state_dict(),
+                "global_step": step,
+                "epoch": epoch,
+                "best_validation_loss": best_loss,
+            },
+            temporary,
+        )
+        temporary.replace(checkpoint)
+
+        if self.run is not None:
+            artifact = trackio.Artifact(
+                name=artifact_name,
+                type="checkpoint",
+                metadata={
+                    "global_step": step,
+                    "epoch": epoch,
+                    "world_size": self.world_size,
+                },
+            )
+            artifact.add_file(checkpoint)
+            self.run.log_artifact(artifact, aliases=aliases)
+
     def train(self) -> None:
-        """Run the configured number of optimizer steps, repeating the loader."""
-        for name in ("steps", "validation_interval"):
+        """Run optimizer steps with nested training and validation progress bars."""
+        for name in ("steps", "validation_interval", "checkpoint_interval"):
             value = getattr(self.config, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive integer.")
 
         validation_loader = self.validation_loader
+
+        epoch = 0
+        best_loss = float("inf")
+        if isinstance(self.train_loader.sampler, DistributedSampler):
+            self.train_loader.sampler.set_epoch(epoch)
+        train_step_fn = (
+            self.train_step_fsdp if self.config.enable_fsdp else self.train_step
+        )
         train_iterator = iter(self.train_loader)
         self.model.train()
-        for step in range(1, self.config.steps + 1):
+        progress = tqdm(
+            range(1, self.config.steps + 1),
+            desc="Training",
+            unit="step",
+            disable=self.rank != 0,
+            mininterval=1.0,
+        )
+        for step in progress:
             try:
                 batch = next(train_iterator)
             except StopIteration:
+                epoch += 1
+                if isinstance(self.train_loader.sampler, DistributedSampler):
+                    self.train_loader.sampler.set_epoch(epoch)
                 train_iterator = iter(self.train_loader)
                 batch = next(train_iterator)
 
-            self.train_step(batch)
+            train_metrics = train_step_fn(batch)
+            metrics = {**train_metrics, "train/epoch": epoch}
             if validation_loader is not None and (
                 step % self.config.validation_interval == 0 or step == self.config.steps
             ):
-                self.perform_validation(validation_loader)
+                validation_metrics = self.perform_validation(validation_loader)
+                metrics.update(validation_metrics)
+
+            validation_loss = metrics.get("validation/loss")
+            is_best = validation_loss is not None and validation_loss < best_loss
+            if validation_loss is not None and is_best:
+                best_loss = validation_loss
+            is_final = step == self.config.steps
+            if step % self.config.checkpoint_interval == 0 or is_best or is_final:
+                aliases = []
+                if is_best:
+                    aliases.append("best")
+                if is_final:
+                    aliases.append("final")
+                self.save_checkpoint(
+                    step=step,
+                    epoch=epoch,
+                    best_loss=best_loss,
+                    artifact_name=(
+                        f"checkpoint-{self.run.id}"
+                        if self.run is not None
+                        else "checkpoint"
+                    ),
+                    aliases=aliases,
+                )
+
+            if self.rank == 0:
+                progress_metrics = (
+                    f"epoch={epoch + 1} "
+                    f"loss={train_metrics['train/loss']:.4f} "
+                    f"lr={train_metrics['train/learning_rate']:.2e}"
+                )
+                if "validation/loss" in metrics:
+                    progress_metrics += f" val_loss={metrics['validation/loss']:.4f}"
+                progress.set_postfix_str(progress_metrics, refresh=False)
+
+            if self.rank == 0 and self.run is not None:
+                self.run.log(metrics, step=step)
+        progress.close()
+
+    def finish(self) -> None:
+        try:
+            if self.run is not None:
+                self.run.finish()
+                self.run = None
+        finally:
+            if self.config.enable_fsdp and dist.is_initialized():
+                dist.destroy_process_group()

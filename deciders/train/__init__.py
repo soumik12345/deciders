@@ -1,3 +1,3 @@
-from deciders.train.sft import SFTTrainer
+from deciders.train.sft import SupervisedTrainer
 
-__all__ = ["SFTTrainer"]
+__all__ = ["SupervisedTrainer"]
