@@ -11,6 +11,7 @@ import trackio
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 from torch.utils.data import DistributedSampler
+from tqdm.auto import tqdm
 
 from deciders.models.kev import KevDecisionModel
 from deciders.utils.train_utils import create_lr_scheduler, create_optimizer
@@ -292,10 +293,18 @@ class SupervisedTrainer(ABC):
         }
         total_record_weight = 0.0
         total_questions = 0
+        progress = tqdm(
+            validation_loader,
+            desc="Validation",
+            unit="batch",
+            leave=False,
+            disable=self.rank != 0,
+            mininterval=1.0,
+        )
         was_training = self.model.training
         self.model.eval()
         try:
-            for batch in validation_loader:
+            for batch in progress:
                 batch_metrics = self.validation_step(batch)
                 record_weight = batch["question_weights"].sum().item()
                 question_count = batch["labels"].numel()
@@ -308,6 +317,13 @@ class SupervisedTrainer(ABC):
                     validation_metrics[name] += batch_metrics[name] * denominator
                 total_record_weight += record_weight
                 total_questions += question_count
+                if self.rank == 0 and total_record_weight > 0:
+                    running_loss = (
+                        validation_metrics["validation/loss"] / total_record_weight
+                    )
+                    progress.set_postfix_str(
+                        f"local loss={running_loss:.4f}", refresh=False
+                    )
 
             if self.config.enable_fsdp:
                 totals = torch.tensor(
@@ -346,10 +362,11 @@ class SupervisedTrainer(ABC):
                 ),
             }
         finally:
+            progress.close()
             self.model.train(was_training)
 
     def train(self) -> None:
-        """Run the configured number of optimizer steps, repeating the loader."""
+        """Run optimizer steps with nested training and validation progress bars."""
         for name in ("steps", "validation_interval"):
             value = getattr(self.config, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -365,7 +382,14 @@ class SupervisedTrainer(ABC):
         )
         train_iterator = iter(self.train_loader)
         self.model.train()
-        for step in range(1, self.config.steps + 1):
+        progress = tqdm(
+            range(1, self.config.steps + 1),
+            desc="Training",
+            unit="step",
+            disable=self.rank != 0,
+            mininterval=1.0,
+        )
+        for step in progress:
             try:
                 batch = next(train_iterator)
             except StopIteration:
@@ -377,15 +401,25 @@ class SupervisedTrainer(ABC):
 
             train_metrics = train_step_fn(batch)
             metrics = {**train_metrics, "train/epoch": epoch}
-
             if validation_loader is not None and (
                 step % self.config.validation_interval == 0 or step == self.config.steps
             ):
                 validation_metrics = self.perform_validation(validation_loader)
                 metrics.update(validation_metrics)
 
+            if self.rank == 0:
+                progress_metrics = (
+                    f"epoch={epoch + 1} "
+                    f"loss={train_metrics['train/loss']:.4f} "
+                    f"lr={train_metrics['train/learning_rate']:.2e}"
+                )
+                if "validation/loss" in metrics:
+                    progress_metrics += f" val_loss={metrics['validation/loss']:.4f}"
+                progress.set_postfix_str(progress_metrics, refresh=False)
+
             if self.rank == 0 and self.run is not None:
                 self.run.log(metrics, step=step)
+        progress.close()
 
     def finish(self) -> None:
         try:
