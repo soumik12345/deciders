@@ -3,7 +3,8 @@ from typing import Any
 
 import torch
 from datasets import load_dataset
-from peft import LoraConfig, TaskType
+from peft import TaskType
+from peft.tuners.lora.config import LoraConfig
 from torch.utils.data import DataLoader, DistributedSampler
 
 from deciders.data import DataCollator, KevDataEncoder
@@ -15,8 +16,10 @@ from deciders.train.sft import (
     TrackioConfig,
 )
 
-trackio_config = TrackioConfig(project_name="kev_0_8b_repro")
-dataloader_config = DataloaderConfig(dataset_name="jaredpalmer/kev-suites")
+trackio_config = TrackioConfig(project_name="deciders", run_name="kev_0_8b_repro_base")
+dataloader_config = DataloaderConfig(
+    dataset_name="jaredpalmer/kev-suites", batch_size=8
+)
 model_config = KevDecisionModelConfig(
     backbone_model_name_or_path="Qwen/Qwen3.5-0.8B-Base",
     pointer_dim=256,
@@ -122,5 +125,7 @@ class KevTrainer(SupervisedTrainer):
 
 
 trainer = KevTrainer(config=trainer_config)
-trainer.train()
-trainer.finish()
+try:
+    trainer.train()
+finally:
+    trainer.finish()

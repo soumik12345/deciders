@@ -85,14 +85,16 @@ class SupervisedTrainer(ABC):
     def __init__(self, config: SupervisedTrainerConfig) -> None:
         self.config = config
 
+        self.rank = 0
+        self.world_size = 1
         if self.config.enable_fsdp:
             if self.config.backend == "tpu":
                 dist.init_process_group(backend="tpu_dist")
-            rank = dist.get_rank()
-            world_size = dist.get_world_size()
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
             mesh = DeviceMesh(
                 device_type="tpu",
-                mesh=torch.arange(world_size),
+                mesh=torch.arange(self.world_size),
                 mesh_dim_names=("fsdp",),
             )
 
@@ -121,14 +123,7 @@ class SupervisedTrainer(ABC):
             {**self.config.lr_scheduler_config, "total_steps": self.config.steps},
         )
 
-        self.run = trackio.init(
-            project=self.config.trackio_config.project_name,
-            name=self.config.trackio_config.run_name,
-            group=self.config.trackio_config.group_name,
-            space_id=self.config.trackio_config.space_id,
-            private=self.config.trackio_config.private,
-            config=asdict(self.config),
-        )
+        self.initialize_trackio()
 
     @abstractmethod
     def create_dataloader(self) -> tuple[DataEncoder, dict[str, DataLoader]]:
@@ -141,6 +136,24 @@ class SupervisedTrainer(ABC):
         raise NotImplementedError(
             "Suclasses of the SFTTrainer must overrive SFTTrainer.create_model"
         )
+
+    def initialize_trackio(self):
+        self.run = None
+        if self.rank == 0:
+            run_config = asdict(self.config)
+            run_config["world_size"] = self.world_size
+            run_config["total_batch_size"] = (
+                self.config.dataloader_config.batch_size * self.world_size
+            )
+            self.run = trackio.init(
+                project=self.config.trackio_config.project_name,
+                name=self.config.trackio_config.run_name,
+                group=self.config.trackio_config.group_name,
+                space_id=self.config.trackio_config.space_id,
+                private=self.config.trackio_config.private,
+                config=run_config,
+                auto_log_gpu=self.config.backend != "cuda",
+            )
 
     def clip_gradients(self) -> float:
         """Clip gradients in place and return their pre-clipping global L2 norm."""
@@ -363,13 +376,22 @@ class SupervisedTrainer(ABC):
                 batch = next(train_iterator)
 
             train_metrics = train_step_fn(batch)
+            metrics = {**train_metrics, "train/epoch": epoch}
+
             if validation_loader is not None and (
                 step % self.config.validation_interval == 0 or step == self.config.steps
             ):
-                self.perform_validation(validation_loader)
+                validation_metrics = self.perform_validation(validation_loader)
+                metrics.update(validation_metrics)
 
-    def finish(self):
-        if hasattr(self, "run"):
-            self.run.finish()
-        if self.config.enable_fsdp:
-            dist.destroy_process_group()
+            if self.rank == 0 and self.run is not None:
+                self.run.log(metrics, step=step)
+
+    def finish(self) -> None:
+        try:
+            if self.run is not None:
+                self.run.finish()
+                self.run = None
+        finally:
+            if self.config.enable_fsdp and dist.is_initialized():
+                dist.destroy_process_group()
