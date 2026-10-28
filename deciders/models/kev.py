@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,39 @@ from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from transformers import AutoModelForCausalLM
+
+
+@dataclass
+class KevDecisionModelConfig:
+    """Configs for initializing the `KevDecisionModel`.
+
+    Args:
+        backbone_model_name_or_path (str): Hugging Face model ID or local
+            checkpoint directory used to load the tokenizer and language model.
+            The model's base model must expose an integer `config.hidden_size`.
+        pointer_dim (int): Dimension of the query and key projections used
+            to score options. Defaults to 256.
+        lora_config (LoraConfig | None): Optional LoRA configuration for the
+            backbone. Must use `TaskType.FEATURE_EXTRACTION`, a positive rank,
+            `lora_alpha = 2 * r`, `lora_dropout = 0.05`, and one of the supported
+            Kev target-module sets. Defaults to None.
+        model_kwargs (dict[str, Any]): Keyword arguments passed to
+            `AutoModelForCausalLM.from_pretrained`. Defaults to BF16 weights
+            and SDPA attention. A supplied dictionary replaces these defaults.
+        revision (str | None): Optional backbone revision used to load both
+            the tokenizer and language model. Defaults to None.
+    """
+
+    backbone_model_name_or_path: str
+    pointer_dim: int = 256
+    lora_config: LoraConfig | None = None
+    model_kwargs: dict[str, Any] = field(
+        default_factory=lambda: {
+            "dtype": torch.bfloat16,
+            "attn_implementation": "sdpa",
+        }
+    )
+    revision: str | None = None
 
 
 class KevDecisionModel(nn.Module):
@@ -40,7 +74,7 @@ class KevDecisionModel(nn.Module):
         model.eval()
 
         encoder = KevDataEncoder.from_pretrained(
-            model.backbone_model_name_or_path, shuffle_choices=False
+            model.config.backbone_model_name_or_path, shuffle_choices=False
         )
 
         options = ["Billing", "Shipping", "Returns"]
@@ -68,20 +102,8 @@ class KevDecisionModel(nn.Module):
         https://github.com/jaredpalmer/kev
 
     Args:
-        backbone_model_name_or_path (str): Hugging Face model ID or local
-            checkpoint directory used to load the tokenizer and language model.
-            The model's base model must expose an integer `config.hidden_size`.
-        pointer_dim (int): Dimension of the query and key projections used
-            to score options. Defaults to 256.
-        lora_config (LoraConfig | None): Optional LoRA configuration for the
-            backbone. Must use `TaskType.FEATURE_EXTRACTION`, a positive rank,
-            `lora_alpha = 2 * r`, `lora_dropout = 0.05`, and one of the supported
-            Kev target-module sets. Defaults to None.
-        model_kwargs (dict[str, Any]): Keyword arguments passed to
-            `AutoModelForCausalLM.from_pretrained`. Defaults to BF16 weights
-            and SDPA attention. A supplied dictionary replaces these defaults.
-        revision (str | None): Optional backbone revision used to load both
-            the tokenizer and language model. Defaults to None.
+        config (KevDecisionModelConfig): Config for initializing the
+            `KevDecisionModel`.
 
     Raises:
         TypeError: If `lora_config` has an invalid type or the backbone's
@@ -89,33 +111,21 @@ class KevDecisionModel(nn.Module):
         ValueError: If `lora_config` does not satisfy the Kev requirements.
     """
 
-    def __init__(
-        self,
-        backbone_model_name_or_path: str,
-        pointer_dim: int = 256,
-        lora_config: LoraConfig | None = None,
-        model_kwargs: dict[str, Any] = {
-            "dtype": torch.bfloat16,
-            "attn_implementation": "sdpa",
-        },
-        *,
-        revision: str | None = None,
-    ) -> None:
+    def __init__(self, config: KevDecisionModelConfig) -> None:
         super().__init__()
-        self._validate_lora_config(lora_config)
-        self.backbone_model_name_or_path = backbone_model_name_or_path
-        self.pointer_dim = pointer_dim
-        self.lora_config = lora_config
+        self.config = config
+        self._validate_lora_config(self.config.lora_config)
         self.calibration_temperature: float = 1.0
 
-        if revision is not None:
-            model_kwargs = {**model_kwargs, "revision": revision}
+        model_kwargs = dict(self.config.model_kwargs)
+        if self.config.revision is not None:
+            model_kwargs["revision"] = self.config.revision
         language_model = AutoModelForCausalLM.from_pretrained(
-            self.backbone_model_name_or_path, **model_kwargs
+            self.config.backbone_model_name_or_path, **model_kwargs
         )
         self.backbone = (
-            get_peft_model(language_model.base_model, self.lora_config)
-            if self.lora_config is not None
+            get_peft_model(language_model.base_model, self.config.lora_config)
+            if self.config.lora_config is not None
             else language_model.base_model
         )
 
@@ -126,12 +136,12 @@ class KevDecisionModel(nn.Module):
             )
 
         self.query_projection = nn.Linear(
-            hidden_size, self.pointer_dim, dtype=torch.float32
+            hidden_size, self.config.pointer_dim, dtype=torch.float32
         )
         self.key_projection = nn.Linear(
-            hidden_size, self.pointer_dim, dtype=torch.float32
+            hidden_size, self.config.pointer_dim, dtype=torch.float32
         )
-        self.scale = self.pointer_dim**-0.5
+        self.scale = self.config.pointer_dim**-0.5
 
     def _validate_lora_config(self, lora_config: LoraConfig | None = None) -> None:
         if lora_config is None:
@@ -380,16 +390,17 @@ class KevDecisionModel(nn.Module):
 
         # Load the exact base and tokenizer used to train the adapter.
         # Do not create a new random adapter in the constructor.
-        model = cls(
+        config = KevDecisionModelConfig(
             backbone_model_name_or_path=metadata["base"],
-            revision=metadata.get("base_revision"),
             pointer_dim=metadata.get("head_dim", 256),
             lora_config=None,
             model_kwargs={
                 "dtype": torch.float32,
                 "attn_implementation": attn_implementation,
             },
+            revision=metadata.get("base_revision"),
         )
+        model = cls(config)
 
         adapted_backbone = PeftModel.from_pretrained(
             model.backbone,
@@ -399,10 +410,10 @@ class KevDecisionModel(nn.Module):
         adapter_config = adapted_backbone.peft_config["default"]
         if not isinstance(adapter_config, LoraConfig):
             raise TypeError("This loader requires a LoRA adapter configuration")
-        model.lora_config = adapter_config
+        model.config.lora_config = adapter_config
 
         # Follow upstream's choice to retain adapters with trained token embeddings.
-        if getattr(model.lora_config, "trainable_token_indices", None):
+        if getattr(adapter_config, "trainable_token_indices", None):
             model.backbone = adapted_backbone
         else:
             model.backbone = adapted_backbone.merge_and_unload()
