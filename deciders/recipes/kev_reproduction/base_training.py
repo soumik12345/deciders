@@ -66,6 +66,9 @@ class KevTrainer(SupervisedTrainer):
         datasets = load_dataset("text", **dataset_kwargs)
         dataloaders = {}
         for split, dataset in datasets.items():
+            # Using 200 validation samples to validate on the fly, to speed up training
+            if split == "validation":
+                dataset = dataset.select(range(min(200, len(dataset))))
             dataset = dataset.with_transform(decode_records)
             is_training = split == "train"
             sampler = None
