@@ -182,37 +182,6 @@ class KevDecisionModel(nn.Module):
                 "in_proj_z, in_proj_a, in_proj_b, out_proj"
             )
 
-    def _validate_forward_params(
-        self,
-        batch_size: int,
-        input_ids: torch.Tensor,
-        option_positions: torch.Tensor,
-        decide_position: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        option_mask: torch.Tensor | None = None,
-    ):
-        if input_ids.ndim != 2:
-            raise ValueError("input_ids must have shape [batch_size, sequence_length]")
-        if option_positions.ndim != 2 or option_positions.shape[0] != batch_size:
-            raise ValueError(
-                "option_positions must have shape [batch_size, num_options]"
-            )
-        if option_positions.shape[1] == 0:
-            raise ValueError("Every example must have at least one option")
-        if decide_position.shape != (batch_size,):
-            raise ValueError("decide_position must have shape [batch_size]")
-        if attention_mask is not None and attention_mask.shape != input_ids.shape:
-            raise ValueError("attention_mask must have the same shape as input_ids")
-        if option_mask is not None:
-            if option_mask.shape != option_positions.shape:
-                raise ValueError(
-                    "option_mask must have the same shape as option_positions"
-                )
-            if option_mask.dtype != torch.bool:
-                raise TypeError("option_mask must have dtype torch.bool")
-            if not option_mask.any(dim=-1).all().item():
-                raise ValueError("Every question must have at least one real option")
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -258,14 +227,6 @@ class KevDecisionModel(nn.Module):
             tensors of shape `(num_real_options,)`. Gradients are preserved.
         """
         batch_size = input_ids.shape[0]
-        self._validate_forward_params(
-            batch_size,
-            input_ids,
-            option_positions,
-            decide_position,
-            attention_mask,
-            option_mask,
-        )
         if not return_logits and questions_per_record is None:
             raise ValueError("questions_per_record is required for grouped output")
         if questions_per_record is not None:
