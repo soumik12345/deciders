@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 from huggingface_hub import snapshot_download
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from transformers import AutoModelForCausalLM
 
 
@@ -421,3 +423,46 @@ class KevDecisionModel(nn.Module):
         model.to(device)
         model.eval()
         return model
+
+
+def shard_kev_decision_model(
+    model: KevDecisionModel, decoder_blocks: list[nn.Module], mesh: DeviceMesh
+):
+    # Set the unsharded stored parameter dtype to FP32
+    model.float()
+
+    # For the backbone, FSDP2 materializes BF16 parameters
+    # for computing activations and gradients.
+    # Across ranks, the gradients are reduced in FP32.
+    backbone_policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,
+        output_dtype=torch.bfloat16,
+    )
+    # The head params are always kept in FP32
+    head_policy = MixedPrecisionPolicy(
+        param_dtype=torch.float32, reduce_dtype=torch.float32
+    )
+
+    # fully_shard: create FSDP groups that manage a set of parameters, i.e,
+    # each group controls where in the world the parameters its managing are stored,
+    # their full copies exist and how the gradients are communicated in the world.
+
+    # Fully shard the attention, MLP and normalization parameters
+    # inside each transformer block from the backbone.
+    for block in decoder_blocks:
+        fully_shard(
+            module=block,
+            mesh=mesh,
+            mp_policy=backbone_policy,
+            reshard_after_forward=True,
+        )
+    # Fully shard the backbone params other than the transformer block params,
+    # i.e, embeddings and final norm
+    fully_shard(
+        model.backbone, mesh=mesh, mp_policy=backbone_policy, reshard_after_forward=True
+    )
+    # Fully shard the remaining model params, i.e, the pointer head params
+    fully_shard(model, mesh=mesh, mp_policy=head_policy, reshard_after_forward=True)
+
+    return model
