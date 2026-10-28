@@ -14,15 +14,25 @@ from datasets import load_dataset
 from peft import TaskType
 from peft.tuners.lora.config import LoraConfig
 from torch.utils.data import DataLoader, DistributedSampler
+from transformers import (
+    AttentionInterface,
+    AttentionMaskInterface,
+)
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedDeltaNet
 
 from deciders.data import DataCollator, KevDataEncoder
 from deciders.models.kev import KevDecisionModel, KevDecisionModelConfig
+from deciders.models.ops import tpu_splash_attention
 from deciders.train.sft import (
     DataloaderConfig,
     SupervisedTrainer,
     SupervisedTrainerConfig,
     TrackioConfig,
+)
+
+AttentionInterface.register("tpu_splash", tpu_splash_attention)
+AttentionMaskInterface.register(
+    "tpu_splash", lambda *args, attention_mask=None, **kwargs: attention_mask
 )
 
 
@@ -133,8 +143,8 @@ if __name__ == "__main__":
             ],
         ),
         model_kwargs={
-            "dtype": torch.float32,
-            "attn_implementation": "sdpa",
+            "dtype": torch.bfloat16,
+            "attn_implementation": "tpu_splash",
         },
     )
     trainer_config = SupervisedTrainerConfig(

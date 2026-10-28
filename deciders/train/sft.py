@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import trackio
+from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 from torch.utils.data import DistributedSampler
@@ -58,6 +60,8 @@ class SupervisedTrainerConfig:
     backend: str = "tpu"
     enable_fsdp: bool = True
     validation_interval: int = 100
+    checkpoint_interval: int = 100
+    checkpoint_dir: Path | str | None = None
     max_grad_norm: float = 1.0
     optimizer_config: dict[str, Any] = field(
         default_factory=lambda: {
@@ -65,7 +69,7 @@ class SupervisedTrainerConfig:
             "lr": 1e-4,
             "weight_decay": 0.01,
             "foreach": False,
-            "fused": False,
+            "fused": True,
         }
     )
     lr_scheduler_config: dict[str, Any] = field(
@@ -112,9 +116,7 @@ class SupervisedTrainer(ABC):
 
         self.model = self.create_model()
         self.model = self.model.shard(mesh) if self.config.enable_fsdp else self.model
-        self.model = torch.compile(
-            self.model, backend=self.config.backend, fullgraph=False, dynamic=False
-        )
+        self.model.compile(backend=self.config.backend, fullgraph=False, dynamic=False)
 
         self.device = next(self.model.parameters()).device
         self.optimizer = create_optimizer(
@@ -124,6 +126,12 @@ class SupervisedTrainer(ABC):
         self.lr_scheduler = create_lr_scheduler(
             self.optimizer,
             {**self.config.lr_scheduler_config, "total_steps": self.config.steps},
+        )
+
+        self.checkpoint_dir = Path(
+            self.config.checkpoint_dir
+            if self.config.checkpoint_dir is not None
+            else "./checkpoint_dir"
         )
 
         self.initialize_trackio()
@@ -144,6 +152,7 @@ class SupervisedTrainer(ABC):
         self.run = None
         if self.rank == 0:
             run_config = asdict(self.config)
+            run_config["checkpoint_dir"] = str(self.checkpoint_dir)
             run_config["world_size"] = self.world_size
             run_config["total_batch_size"] = (
                 self.config.dataloader_config.batch_size * self.world_size
@@ -367,9 +376,61 @@ class SupervisedTrainer(ABC):
             progress.close()
             self.model.train(was_training)
 
+    def save_checkpoint(
+        self,
+        step: int,
+        epoch: int,
+        best_loss: float,
+        artifact_name: str,
+        aliases: list[str],
+    ) -> None:
+        # Collective operation: all FSDP ranks must enter.
+        model_state, optimizer_state = get_state_dict(
+            self.model,
+            self.optimizer,
+            options=StateDictOptions(
+                full_state_dict=True,
+                cpu_offload=True,
+            ),
+        )
+
+        if self.rank != 0:
+            return
+
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        temporary = self.checkpoint_dir / "training.pt.tmp"
+        checkpoint = self.checkpoint_dir / "training.pt"
+
+        torch.save(
+            {
+                "format_version": 1,
+                "model": model_state,
+                "optimizer": optimizer_state,
+                "scheduler": self.lr_scheduler.state_dict(),
+                "global_step": step,
+                "epoch": epoch,
+                "best_validation_loss": best_loss,
+            },
+            temporary,
+        )
+        temporary.replace(checkpoint)
+
+        if self.run is not None:
+            artifact = trackio.Artifact(
+                name=artifact_name,
+                type="checkpoint",
+                metadata={
+                    "global_step": step,
+                    "epoch": epoch,
+                    "world_size": self.world_size,
+                },
+            )
+            artifact.add_file(checkpoint)
+            self.run.log_artifact(artifact, aliases=aliases)
+
     def train(self) -> None:
         """Run optimizer steps with nested training and validation progress bars."""
-        for name in ("steps", "validation_interval"):
+        for name in ("steps", "validation_interval", "checkpoint_interval"):
             value = getattr(self.config, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive integer.")
@@ -377,6 +438,7 @@ class SupervisedTrainer(ABC):
         validation_loader = self.validation_loader
 
         epoch = 0
+        best_loss = float("inf")
         if isinstance(self.train_loader.sampler, DistributedSampler):
             self.train_loader.sampler.set_epoch(epoch)
         train_step_fn = (
@@ -408,6 +470,29 @@ class SupervisedTrainer(ABC):
             ):
                 validation_metrics = self.perform_validation(validation_loader)
                 metrics.update(validation_metrics)
+
+            validation_loss = metrics.get("validation/loss")
+            is_best = validation_loss is not None and validation_loss < best_loss
+            if validation_loss is not None and is_best:
+                best_loss = validation_loss
+            is_final = step == self.config.steps
+            if step % self.config.checkpoint_interval == 0 or is_best or is_final:
+                aliases = []
+                if is_best:
+                    aliases.append("best")
+                if is_final:
+                    aliases.append("final")
+                self.save_checkpoint(
+                    step=step,
+                    epoch=epoch,
+                    best_loss=best_loss,
+                    artifact_name=(
+                        f"checkpoint-{self.run.id}"
+                        if self.run is not None
+                        else "checkpoint"
+                    ),
+                    aliases=aliases,
+                )
 
             if self.rank == 0:
                 progress_metrics = (
