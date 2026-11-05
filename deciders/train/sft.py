@@ -6,13 +6,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 import trackio
-from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict
-from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor
-from torch.utils.data import DistributedSampler
 from tqdm.auto import tqdm
 
 from deciders.models.kev import KevDecisionModel
@@ -58,7 +53,6 @@ class SupervisedTrainerConfig:
     epochs: int = 1
     steps: int = 1
     backend: str = "tpu"
-    enable_fsdp: bool = True
     validation_interval: int = 100
     checkpoint_interval: int = 100
     checkpoint_dir: Path | str | None = None
@@ -92,19 +86,6 @@ class SupervisedTrainer(ABC):
     def __init__(self, config: SupervisedTrainerConfig) -> None:
         self.config = config
 
-        self.rank = 0
-        self.world_size = 1
-        if self.config.enable_fsdp:
-            if self.config.backend == "tpu":
-                dist.init_process_group(backend="tpu_dist")
-            self.rank = dist.get_rank()
-            self.world_size = dist.get_world_size()
-            mesh = DeviceMesh(
-                device_type="tpu",
-                mesh=torch.arange(self.world_size),
-                mesh_dim_names=("fsdp",),
-            )
-
         torch.manual_seed(self.config.seed)
         self.data_encoder, dataloaders = self.create_dataloader()
         if "train" not in dataloaders:
@@ -115,7 +96,6 @@ class SupervisedTrainer(ABC):
             self.validation_loader = dataloaders.get("val")
 
         self.model = self.create_model()
-        self.model = self.model.shard(mesh) if self.config.enable_fsdp else self.model
         self.model.compile(backend=self.config.backend, fullgraph=False, dynamic=False)
 
         self.device = next(self.model.parameters()).device
@@ -149,26 +129,21 @@ class SupervisedTrainer(ABC):
         )
 
     def initialize_trackio(self):
-        self.run = None
-        if self.rank == 0:
-            run_config = asdict(self.config)
-            run_config["checkpoint_dir"] = str(self.checkpoint_dir)
-            run_config["world_size"] = self.world_size
-            run_config["total_batch_size"] = (
-                self.config.dataloader_config.batch_size * self.world_size
-            )
-            self.run = trackio.init(
-                project=self.config.trackio_config.project_name,
-                name=self.config.trackio_config.run_name,
-                group=self.config.trackio_config.group_name,
-                space_id=self.config.trackio_config.space_id,
-                private=self.config.trackio_config.private,
-                config=run_config,
-                auto_log_gpu=self.config.backend != "cuda",
-            )
+        run_config = asdict(self.config)
+        run_config["checkpoint_dir"] = str(self.checkpoint_dir)
+        run_config["total_batch_size"] = self.config.dataloader_config.batch_size
+        self.run = trackio.init(
+            project=self.config.trackio_config.project_name,
+            name=self.config.trackio_config.run_name,
+            group=self.config.trackio_config.group_name,
+            space_id=self.config.trackio_config.space_id,
+            private=self.config.trackio_config.private,
+            config=run_config,
+            auto_log_gpu=self.config.backend != "cuda",
+        )
 
     def clip_gradients(self) -> float:
-        """Clip gradients in place and return their pre-clipping global L2 norm."""
+        """Clip gradients in place and return their pre-clipping L2 norm."""
         grad_norm = torch.nn.utils.clip_grad_norm_(
             parameters=(
                 parameter
@@ -180,11 +155,6 @@ class SupervisedTrainer(ABC):
             error_if_nonfinite=True,
             foreach=False,
         )
-
-        # Under FSDP2, the returned norm can itself be a DTensor, so we need to
-        # materialize the global scalar for logging on every rank.
-        if isinstance(grad_norm, DTensor):
-            grad_norm = grad_norm.full_tensor()
 
         return grad_norm.item()
 
@@ -221,55 +191,6 @@ class SupervisedTrainer(ABC):
             "train/grad_norm": grad_norm,
         }
 
-    def train_step_fsdp(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
-        batch = {key: value.to(self.device) for key, value in batch.items()}
-        labels = batch.pop("labels")
-        weights = batch.pop("question_weights")
-
-        self.optimizer.zero_grad(set_to_none=True)
-
-        logits = self.model(**batch, temperature=1.0, return_logits=True)
-        per_question_loss = F.cross_entropy(logits.float(), labels, reduction="none")
-        local_loss_sum = (per_question_loss * weights).sum()
-        local_weight = weights.sum()
-
-        global_weight = local_weight.detach().clone()
-        dist.all_reduce(global_weight, op=dist.ReduceOp.SUM)
-
-        loss_for_gradient_computation = (
-            local_loss_sum * dist.get_world_size() / global_weight
-        )
-        lr_for_logging = self.optimizer.param_groups[0]["lr"]
-        loss_for_gradient_computation.backward()
-        grad_norm = self.clip_gradients()
-        self.optimizer.step()
-        self.lr_scheduler.step()
-
-        with torch.no_grad():
-            correct_predictions = logits.argmax(dim=-1).eq(labels).float()
-            stats = torch.stack(
-                [
-                    local_loss_sum.detach(),
-                    (correct_predictions * weights).sum(),
-                    correct_predictions.sum(),
-                    local_weight,
-                    weights.new_tensor(labels.numel()),
-                ]
-            )
-            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-
-            loss_sum, record_correct, question_correct, weight, count = (
-                stats.cpu().tolist()
-            )
-
-        return {
-            "train/loss": loss_sum / weight,
-            "train/accuracy_record": record_correct / weight,
-            "train/accuracy_question": question_correct / count,
-            "train/learning_rate": lr_for_logging,
-            "train/grad_norm": grad_norm,
-        }
-
     @torch.no_grad()
     def validation_step(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
         batch = {key: value.to(self.device) for key, value in batch.items()}
@@ -290,12 +211,10 @@ class SupervisedTrainer(ABC):
 
     @torch.no_grad()
     def perform_validation(self, validation_loader: DataLoader) -> dict[str, float]:
-        """Aggregate validation metrics locally and, with FSDP, across ranks.
+        """Aggregate validation metrics over the full validation loader.
 
-        Reduce metric numerators and denominators once after the local loop,
-        then compute global means. All FSDP ranks must participate with matching
-        forward counts. The loader must avoid counting sampler-padding duplicates
-        for exact dataset metrics. Restore the model's previous mode on exit.
+        Weight record and question metrics by their respective counts and
+        restore the model's previous mode on exit.
         """
         validation_metrics = {
             "validation/loss": 0.0,
@@ -309,7 +228,6 @@ class SupervisedTrainer(ABC):
             desc="Validation",
             unit="batch",
             leave=False,
-            disable=self.rank != 0,
             mininterval=1.0,
         )
         was_training = self.model.training
@@ -328,34 +246,11 @@ class SupervisedTrainer(ABC):
                     validation_metrics[name] += batch_metrics[name] * denominator
                 total_record_weight += record_weight
                 total_questions += question_count
-                if self.rank == 0 and total_record_weight > 0:
+                if total_record_weight > 0:
                     running_loss = (
                         validation_metrics["validation/loss"] / total_record_weight
                     )
-                    progress.set_postfix_str(
-                        f"local loss={running_loss:.4f}", refresh=False
-                    )
-
-            if self.config.enable_fsdp:
-                totals = torch.tensor(
-                    [
-                        validation_metrics["validation/loss"],
-                        validation_metrics["validation/accuracy_record"],
-                        validation_metrics["validation/accuracy_question"],
-                        total_record_weight,
-                        total_questions,
-                    ],
-                    dtype=torch.float32,
-                    device=self.device,
-                )
-                dist.all_reduce(totals, op=dist.ReduceOp.SUM)
-                (
-                    validation_metrics["validation/loss"],
-                    validation_metrics["validation/accuracy_record"],
-                    validation_metrics["validation/accuracy_question"],
-                    total_record_weight,
-                    total_questions,
-                ) = totals.cpu().tolist()
+                    progress.set_postfix_str(f"loss={running_loss:.4f}", refresh=False)
 
             if total_questions == 0 or total_record_weight <= 0:
                 raise ValueError(
@@ -384,19 +279,6 @@ class SupervisedTrainer(ABC):
         artifact_name: str,
         aliases: list[str],
     ) -> None:
-        # Collective operation: all FSDP ranks must enter.
-        model_state, optimizer_state = get_state_dict(
-            self.model,
-            self.optimizer,
-            options=StateDictOptions(
-                full_state_dict=True,
-                cpu_offload=True,
-            ),
-        )
-
-        if self.rank != 0:
-            return
-
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         temporary = self.checkpoint_dir / "training.pt.tmp"
         checkpoint = self.checkpoint_dir / "training.pt"
@@ -404,8 +286,8 @@ class SupervisedTrainer(ABC):
         torch.save(
             {
                 "format_version": 1,
-                "model": model_state,
-                "optimizer": optimizer_state,
+                "model": self.model.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
                 "scheduler": self.lr_scheduler.state_dict(),
                 "global_step": step,
                 "epoch": epoch,
@@ -422,7 +304,6 @@ class SupervisedTrainer(ABC):
                 metadata={
                     "global_step": step,
                     "epoch": epoch,
-                    "world_size": self.world_size,
                 },
             )
             artifact.add_file(checkpoint)
@@ -439,18 +320,12 @@ class SupervisedTrainer(ABC):
 
         epoch = 0
         best_loss = float("inf")
-        if isinstance(self.train_loader.sampler, DistributedSampler):
-            self.train_loader.sampler.set_epoch(epoch)
-        train_step_fn = (
-            self.train_step_fsdp if self.config.enable_fsdp else self.train_step
-        )
         train_iterator = iter(self.train_loader)
         self.model.train()
         progress = tqdm(
             range(1, self.config.steps + 1),
             desc="Training",
             unit="step",
-            disable=self.rank != 0,
             mininterval=1.0,
         )
         for step in progress:
@@ -458,12 +333,10 @@ class SupervisedTrainer(ABC):
                 batch = next(train_iterator)
             except StopIteration:
                 epoch += 1
-                if isinstance(self.train_loader.sampler, DistributedSampler):
-                    self.train_loader.sampler.set_epoch(epoch)
                 train_iterator = iter(self.train_loader)
                 batch = next(train_iterator)
 
-            train_metrics = train_step_fn(batch)
+            train_metrics = self.train_step(batch)
             metrics = {**train_metrics, "train/epoch": epoch}
             if validation_loader is not None and (
                 step % self.config.validation_interval == 0 or step == self.config.steps
@@ -494,25 +367,20 @@ class SupervisedTrainer(ABC):
                     aliases=aliases,
                 )
 
-            if self.rank == 0:
-                progress_metrics = (
-                    f"epoch={epoch + 1} "
-                    f"loss={train_metrics['train/loss']:.4f} "
-                    f"lr={train_metrics['train/learning_rate']:.2e}"
-                )
-                if "validation/loss" in metrics:
-                    progress_metrics += f" val_loss={metrics['validation/loss']:.4f}"
-                progress.set_postfix_str(progress_metrics, refresh=False)
+            progress_metrics = (
+                f"epoch={epoch + 1} "
+                f"loss={train_metrics['train/loss']:.4f} "
+                f"lr={train_metrics['train/learning_rate']:.2e}"
+            )
+            if "validation/loss" in metrics:
+                progress_metrics += f" val_loss={metrics['validation/loss']:.4f}"
+            progress.set_postfix_str(progress_metrics, refresh=False)
 
-            if self.rank == 0 and self.run is not None:
+            if self.run is not None:
                 self.run.log(metrics, step=step)
         progress.close()
 
     def finish(self) -> None:
-        try:
-            if self.run is not None:
-                self.run.finish()
-                self.run = None
-        finally:
-            if self.config.enable_fsdp and dist.is_initialized():
-                dist.destroy_process_group()
+        if self.run is not None:
+            self.run.finish()
+            self.run = None

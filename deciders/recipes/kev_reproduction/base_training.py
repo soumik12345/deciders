@@ -13,7 +13,7 @@ import torch
 from datasets import load_dataset
 from peft import TaskType
 from peft.tuners.lora.config import LoraConfig
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
 from transformers import (
     AttentionInterface,
     AttentionMaskInterface,
@@ -81,16 +81,10 @@ class KevTrainer(SupervisedTrainer):
                 dataset = dataset.select(range(min(200, len(dataset))))
             dataset = dataset.with_transform(decode_records)
             is_training = split == "train"
-            sampler = None
-            if is_training and self.config.enable_fsdp:
-                sampler = DistributedSampler(
-                    dataset, shuffle=config.shuffle, seed=self.config.seed
-                )
             dataloaders[split] = DataLoader(
                 dataset,
                 batch_size=config.batch_size,
-                shuffle=is_training and config.shuffle and sampler is None,
-                sampler=sampler,
+                shuffle=is_training and config.shuffle,
                 num_workers=config.num_workers,
                 collate_fn=DataCollator(
                     data_encoder if is_training else validation_encoder
@@ -104,7 +98,7 @@ class KevTrainer(SupervisedTrainer):
         for module in model.modules():
             if isinstance(module, Qwen3_5GatedDeltaNet):
                 module.forward = torch.compiler.disable(module.forward, recursive=True)  # type: ignore
-        return model
+        return model.to("tpu")
 
 
 if __name__ == "__main__":
