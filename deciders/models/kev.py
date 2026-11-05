@@ -9,8 +9,6 @@ import torch
 import torch.nn as nn
 from huggingface_hub import snapshot_download
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
-from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from transformers import AutoModelForCausalLM
 
 
@@ -395,73 +393,3 @@ class KevDecisionModel(nn.Module):
         model.to(device)
         model.eval()
         return model
-
-    def shard(self, mesh: DeviceMesh) -> KevDecisionModel:
-        """Shard the model in place with PyTorch FSDP2.
-
-        Args:
-            mesh (DeviceMesh): Device mesh defining the FSDP ranks and device
-                type. For eight-way TorchTPU sharding, use a one-dimensional
-                eight-rank mesh with device type ``"tpu"``.
-
-        Returns:
-            KevDecisionModel: This model, modified in place for FSDP2.
-
-        Raises:
-            TypeError: If the unwrapped backbone's ``layers`` attribute is
-                missing or is not an ``nn.ModuleList``.
-        """
-        # Set the unsharded stored parameter dtype to FP32
-        self.to(device=torch.device(mesh.device_type), dtype=torch.float32)
-
-        # For the backbone, FSDP2 materializes BF16 parameters
-        # for computing activations and gradients.
-        # Across ranks, the gradients are reduced in FP32.
-        backbone_policy = MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
-            output_dtype=torch.bfloat16,
-        )
-        # The head params are always kept in FP32
-        head_policy = MixedPrecisionPolicy(
-            param_dtype=torch.float32, reduce_dtype=torch.float32
-        )
-
-        # Access transformer layers in the backbone
-        backbone = self.backbone
-        if isinstance(backbone, PeftModel):
-            backbone = backbone.get_base_model()
-        layers = getattr(backbone, "layers", None)
-        if not isinstance(layers, nn.ModuleList):
-            raise TypeError(
-                f"Expected {type(backbone).__name__}.layers to be an nn.ModuleList; "
-                "this backbone may expose its decoder blocks through another path."
-            )
-        backbone_transformer_blocks: list[nn.Module] = list(layers)
-
-        # fully_shard: create FSDP groups that manage a set of parameters, i.e,
-        # each group controls where in the world the parameters its managing are stored,
-        # their mixed-precision policy, their full copies exist and how the gradients are
-        # communicated in the world.
-
-        # Fully shard the attention, MLP and normalization parameters
-        # inside each transformer block from the backbone.
-        for block in backbone_transformer_blocks:
-            fully_shard(
-                module=block,
-                mesh=mesh,
-                mp_policy=backbone_policy,
-                reshard_after_forward=True,
-            )
-        # Fully shard the backbone params other than the transformer block params,
-        # i.e, embeddings and final norm
-        fully_shard(
-            self.backbone,
-            mesh=mesh,
-            mp_policy=backbone_policy,
-            reshard_after_forward=True,
-        )
-        # Fully shard the remaining model params, i.e, the pointer head params
-        fully_shard(self, mesh=mesh, mp_policy=head_policy, reshard_after_forward=True)
-
-        return self
